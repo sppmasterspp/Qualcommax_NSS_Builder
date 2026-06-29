@@ -1,0 +1,20 @@
+# WAN->LAN IPTV routed-multicast topology for igmpproxy. Started opt-in by
+# /usr/sbin/nss-up (boot autostart disabled by uci-defaults 997-igmpproxy-optin).
+# upstream = PPPoE WAN (pppoe-wan / logical 'wan'); downstream = LAN bridge
+# (br-lan / logical 'lan'). Overrides the package default (which wrongly lists a
+# LAN subnet as the upstream altnet). Conffile: user edits survive sysupgrade.
+# Inert until a real multicast source exists upstream (this user has no IPTV).
+
+config igmpproxy
+	option quickleave 1
+
+config phyint
+	option network wan
+	option zone wan
+	option direction upstream
+	list altnet 0.0.0.0/0
+
+config phyint
+	option network lan
+	option zone lan
+	option direction downstream

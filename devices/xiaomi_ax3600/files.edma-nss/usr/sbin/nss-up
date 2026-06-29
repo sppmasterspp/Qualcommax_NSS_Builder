@@ -101,6 +101,15 @@ echo f > /proc/net/nf_conntrack 2>/dev/null
 echo "NSS+wifi+ECM up. accel counts:"
 cat /sys/kernel/debug/ecm/ecm_nss_ipv4/accelerated_count /sys/kernel/debug/ecm/ecm_nss_ipv6/accelerated_count
 
+# Routed (L3) multicast: start the IGMP proxy now that pppoe-wan has an address.
+# Opt-in with this script; its init is disabled at boot (uci-defaults 997) so it
+# never runs on a host-only boot. start_service self-guards (returns early unless
+# a configured upstream phyint is up), so this is safe to call unconditionally and
+# is a no-op without a WAN multicast source. Each kernel MFC entry igmpproxy
+# installs becomes a PPE hardware rule via ECM's routed-mc classifier (watch
+# ipv4_mc_connection_create_requests in /sys/kernel/debug/qca-nss-drv/stats/ipv4).
+[ -x /usr/sbin/igmpproxy ] && /etc/init.d/igmpproxy start 2>/dev/null || true
+
 # Start SQM, retrying until the NSS shaper actually attaches to wan
 # (check_addr can still lose a race in the first moments after the IP appears).
 if /etc/init.d/sqm enabled; then

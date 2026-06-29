@@ -113,6 +113,14 @@ CONFIG_PACKAGE_kmod-qca-nss-drv-bridge-mgr=y
 CONFIG_PACKAGE_kmod-qca-mcs=y
 CONFIG_KERNEL_IP_MROUTE=y
 CONFIG_KERNEL_IPV6_MROUTE=y
+## Routed (L3) multicast offload (IPTV WAN->LAN). igmpproxy proxies LAN IGMP
+## joins upstream and installs kernel ipmr MFC (S,G) entries; ECM's routed-
+## multicast classifier (ECM_MULTICAST_ENABLE, already on) turns each MFC entry
+## into a PPE hardware rule. Pure userspace (no kmod, no extra kernel config).
+## Started opt-in by /usr/sbin/nss-up; its init is disabled at boot by
+## uci-defaults 997. INERT unless a WAN multicast source exists (no IPTV here ->
+## no-op in production; proven by the routed-mc gate).
+CONFIG_PACKAGE_igmpproxy=y
 CONFIG_NSS_FIRMWARE_VERSION_12_5=y
 # AX3600 = 512MB RAM: NSS MEDIUM memory profile (HIGH is the ipq807x default and wrong here)
 CONFIG_NSS_MEM_PROFILE_MEDIUM=y
