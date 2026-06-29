@@ -1,0 +1,174 @@
+#!/bin/sh
+
+# Primarily intended for Asus RT-AX89X modded using Noctua NF-A9 fan (12 V)
+mod_fan=${mod_fan:-false}
+debug=${debug:-false}
+interval_sec=30
+cooldown_intervals=2
+
+if $mod_fan; then
+  cpu_threshold_max_deg=75.0
+else
+  cpu_threshold_low_deg=72.0
+  cpu_threshold_mid_deg=76.0
+  cpu_threshold_max_deg=80.0
+fi
+
+wifi_threshold_deg=80.0
+max_rpm=2100
+mid_rpm=1850
+low_rpm=1600
+off_rpm=0
+
+hwmon_glob='/sys/class/hwmon/hwmon*'
+thermal_zone_mode_glob='/sys/class/thermal/thermal_zone*/mode'
+
+fan_hwmon_pattern='*/gpio-fan/*'
+cpu_hwmon_pattern='*/soc*/soc*'
+wifi1_hwmon_pattern='*wifi/ieee80211/phy0/*'
+wifi2_hwmon_pattern='*wifi/ieee80211/phy1/*'
+
+fan_hwmon_path=''
+cpu_hwmon_path=''
+wifi1_hwmon_path=''
+wifi2_hwmon_path=''
+
+fan_target='fan1_target'
+temp_input="temp1_input"
+
+echo_debug() {
+  if $debug; then echo "$@" >&2; fi
+}
+
+printf_debug() {
+  if $debug; then printf "%b" "$@" >&2; fi
+}
+
+configure_monitor() {
+  for hwmon in $hwmon_glob; do
+    hwmon_path=$(readlink -f $hwmon)
+    case "$hwmon_path" in
+      $fan_hwmon_pattern) fan_hwmon_path="$hwmon_path" ;;
+      $cpu_hwmon_pattern) cpu_hwmon_path="$hwmon_path" ;;
+      $wifi1_hwmon_pattern) wifi1_hwmon_path="$hwmon_path" ;;
+      $wifi2_hwmon_pattern) wifi2_hwmon_path="$hwmon_path" ;;
+    esac
+  done
+
+  [ -z "$fan_hwmon_path" ] && echo "Can't find fan hwmon path!" && exit 1
+  [ -z "$cpu_hwmon_path" ] && echo "Can't find cpu hwmon path!" && exit 1
+  [ -z "$wifi1_hwmon_path" ] && echo "Can't find wifi 1 hwmon path!" && exit 1
+  [ -z "$wifi2_hwmon_path" ] && echo "Can't find wifi 2 hwmon path!" && exit 1
+}
+
+fan_set_auto() {
+  for mode in $thermal_zone_mode_glob; do echo 'enabled' > "$mode"; done
+}
+
+fan_set_manual() {
+  for mode in $thermal_zone_mode_glob; do echo 'disabled' > "$mode"; done
+}
+
+configure_fan_modes() {
+  trap "{ fan_set_auto; exit; }" EXIT SIGINT SIGTERM
+  fan_set_manual
+}
+
+fan_get_rpm() {
+  cat ${fan_hwmon_path}/${fan_target}
+}
+
+fan_set_rpm() {
+  echo "$1" > ${fan_hwmon_path}/${fan_target}
+}
+
+bool() {
+  [ "$1" -eq 1 ]
+}
+
+fan_set() {
+  local cur_rpm=$(fan_get_rpm)
+  local new_rpm="$1"
+  if [ "$new_rpm" -ne "$cur_rpm" ]; then fan_set_rpm $new_rpm; fi
+}
+
+calc() {
+  awk 'BEGIN { OFMT = "%.2f"; print '"$1"' }'
+}
+
+cmpr() {
+  awk 'BEGIN { if ('"$1"') print "true"; else print "false" }'
+}
+
+cpu_temp() {
+  calc "$(cat ${cpu_hwmon_path}/${temp_input}) / 1000"
+}
+
+wifi1_temp() {
+  calc "$(cat ${wifi1_hwmon_path}/${temp_input}) / 1000"
+}
+
+wifi2_temp() {
+  calc "$(cat ${wifi2_hwmon_path}/${temp_input}) / 1000"
+}
+
+fan_compute_rpm_from_wifi() {
+  local wifi1_deg=$(wifi1_temp)
+  local wifi2_deg=$(wifi2_temp)
+  local fan_rpm=$off_rpm
+  if $(cmpr "${wifi1_deg} > ${wifi_threshold_deg}"); then fan_rpm=$max_rpm; fi
+  if $(cmpr "${wifi2_deg} > ${wifi_threshold_deg}"); then fan_rpm=$max_rpm; fi
+  printf "%u" $fan_rpm
+}
+
+fan_compute_rpm_from_cpu_mod() {
+  local cpu_deg=$(cpu_temp)
+  local fan_rpm=$off_rpm
+  if $(cmpr "${cpu_deg} > ${cpu_threshold_max_deg}"); then fan_rpm=$max_rpm; fi
+  printf "%u" $fan_rpm
+}
+
+fan_compute_rpm_from_cpu_stock() {
+  local cpu_deg=$(cpu_temp)
+  local fan_rpm=$off_rpm
+  if $(cmpr "${cpu_deg} > ${cpu_threshold_low_deg}") && $(cmpr "${cpu_deg} <= ${cpu_threshold_mid_deg}"); then
+    fan_rpm=$low_rpm
+  elif $(cmpr "${cpu_deg} > ${cpu_threshold_mid_deg}") && $(cmpr "${cpu_deg} <= ${cpu_threshold_max_deg}"); then
+    fan_rpm=$mid_rpm
+  elif $(cmpr "${cpu_deg} > ${cpu_threshold_max_deg}"); then
+    fan_rpm=$max_rpm
+  fi
+  printf "%u" $fan_rpm
+}
+
+fan_compute_rpm() {
+  local fan_rpm=$off_rpm
+  if $mod_fan; then
+    fan_rpm=$(fan_compute_rpm_from_cpu_mod)
+  else
+    fan_rpm=$(fan_compute_rpm_from_cpu_stock)
+  fi
+  local fan_rpm_from_wifi=$(fan_compute_rpm_from_wifi)
+  if [ "$fan_rpm_from_wifi" -gt "$fan_rpm" ]; then fan_rpm=$fan_rpm_from_wifi; fi
+  printf "%u" $fan_rpm
+}
+
+run_monitor() {
+  local cooldown_iteration=0
+  while true; do
+    local fan_rpm=$(fan_compute_rpm)
+    if [ "$fan_rpm" -ne "$off_rpm" ]; then
+      cooldown_iteration=0
+      fan_set $fan_rpm
+    elif [ "$cooldown_iteration" -eq 0 ]; then
+      fan_set $fan_rpm
+    fi
+    sleep $interval_sec &
+    wait %1
+    cooldown_iteration=$(( (cooldown_iteration + 1) % cooldown_intervals ))
+  done
+}
+
+configure_monitor
+configure_fan_modes
+run_monitor

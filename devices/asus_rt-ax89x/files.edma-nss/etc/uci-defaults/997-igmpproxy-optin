@@ -1,0 +1,8 @@
+#!/bin/sh
+# Make the IGMP proxy strictly opt-in with the NSS plane: the package bakes an
+# S99 boot-enable symlink, but routed multicast must come up ONLY via
+# /usr/sbin/nss-up. Disabling boot autostart keeps a host-only / NSS-off boot
+# (rc.local line commented) from ever running it. Idempotent; runs once at first
+# boot. Runs before 998/999 (net-offload / sqm), order is irrelevant here.
+[ -x /etc/init.d/igmpproxy ] && /etc/init.d/igmpproxy disable 2>/dev/null
+exit 0
