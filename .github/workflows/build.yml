@@ -1,6 +1,6 @@
 name: Build
 
-# Builds the single edma-nss image for the Xiaomi AX3600:
+# Builds the single edma-nss image for the Asus RT-AX89X:
 #   check (upstream moved?) -> build -> prune
 # All build parameters live in the `env:` block below — it is the one file you edit.
 on:
@@ -27,7 +27,7 @@ env:
   NSS_REPO: JuliusBairaktaris/nss-packages
   NSS_REF: edma-nss
   TARGET: qualcommax/ipq807x
-  DEVICE: xiaomi_ax3600
+  DEVICE: asus_rt-ax89x
   VARIANT: edma-nss
   RELEASE_PREFIX: edma-nss
   KEEP: "2"                     # newest releases to retain
@@ -52,7 +52,7 @@ jobs:
         run: bash scripts/check-updates.sh
 
   build:
-    name: Build edma-nss (xiaomi_ax3600)
+    name: Build edma-nss (asus_rt-ax89x)
     needs: check
     if: needs.check.outputs.need == 'true'
     runs-on: ubuntu-26.04
