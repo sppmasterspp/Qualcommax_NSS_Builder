@@ -160,7 +160,7 @@ jobs:
         # The flavour is a .config fragment on top of the same overlays and the
         # same source trees; mesh needs the 11.4 firmware, which is image-wide
         # too, so it cannot share a build with the default flavour either.
-        flavour: [default]
+        flavour: [default, mesh]
         include:
           - flavour: mesh
             config_fragment: devices/common/config.mesh
