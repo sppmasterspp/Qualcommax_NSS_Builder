@@ -1,0 +1,501 @@
+#!/bin/sh
+
+. /usr/share/libubox/jshn.sh
+. /usr/lib/fan_monitor/common.sh
+
+INIT=/etc/init.d/fan_monitor
+LOCK=/var/run/fan_monitor.lock
+RUNTIME=/var/run/fan_monitor.status
+
+is_uint() { fm_is_uint "$1"; }
+
+is_state() {
+	case "$1" in 0|1|2|3) return 0 ;; *) return 1 ;; esac
+}
+
+bool_num() {
+	case "$1" in 1|true|yes|on) echo 1 ;; *) echo 0 ;; esac
+}
+
+read_temp() {
+	local file="$1" value
+	TEMP_VALUE=''
+	[ -r "$file" ] || return 1
+	value="$(cat "$file" 2>/dev/null)" || return 1
+	is_uint "$value" || return 1
+	[ "$value" -le 125000 ] || return 1
+	TEMP_VALUE="$value"
+	return 0
+}
+
+uci_value() {
+	local option="$1" default="$2" value
+	value="$(uci -q get "fan_monitor.main.$option" 2>/dev/null)"
+	[ -n "$value" ] || value="$default"
+	echo "$value"
+}
+
+uci_temp_mdeg() {
+	local option="$1" default="$2" value
+	value="$(uci_value "$option" "$default")"
+	is_uint "$value" || value="$default"
+	[ "$value" -le 125 ] || value="$default"
+	echo "$((value * 1000))"
+}
+
+band_state() {
+	local temp="$1" low="$2" mid="$3" max="$4"
+	BAND_STATE=''
+	is_uint "$temp" || return 1
+	if [ "$temp" -ge "$max" ]; then BAND_STATE=3
+	elif [ "$temp" -ge "$mid" ]; then BAND_STATE=2
+	elif [ "$temp" -ge "$low" ]; then BAND_STATE=1
+	else BAND_STATE=0
+	fi
+}
+
+max_request_state() {
+	local state
+	MAX_REQUEST_STATE=0
+	for state in "$@"; do
+		is_state "$state" || continue
+		[ "$state" -gt "$MAX_REQUEST_STATE" ] && MAX_REQUEST_STATE="$state"
+	done
+}
+
+load_runtime() {
+	runtime_available=0
+	runtime_cpu_temp=''
+	runtime_aqr_temp=''
+	runtime_wifi0_temp=''
+	runtime_wifi1_temp=''
+	runtime_cpu_state=''
+	runtime_aqr_state=''
+	runtime_wifi0_state=''
+	runtime_wifi1_state=''
+	runtime_desired_state=''
+	runtime_fan_state=''
+	runtime_cpu_failsafe=0
+	runtime_aqr_failsafe=0
+	runtime_wifi0_failsafe=0
+	runtime_wifi1_failsafe=0
+	runtime_pending_state=''
+	runtime_pending_count=0
+	runtime_aqr_model=''
+	runtime_aqr_driver=''
+	runtime_aqr_phy_id=''
+	runtime_aqr_mdio_address=''
+	runtime_aqr_of_path=''
+	runtime_aqr_netdev=''
+	runtime_aqr_detection_method=''
+	runtime_aqr_temp_input=''
+	runtime_aqr_identity_warning=''
+	runtime_router_model=''
+	runtime_router_hw_revision=''
+	runtime_router_pcb_revision=''
+	runtime_router_revision_confidence=''
+	runtime_router_revision_basis=''
+
+	[ -r "$RUNTIME" ] || return 0
+
+	while IFS='=' read -r key value; do
+		case "$key" in
+			cpu_temp) is_uint "$value" && runtime_cpu_temp="$value" ;;
+			aqr_temp) is_uint "$value" && runtime_aqr_temp="$value" ;;
+			wifi0_temp) is_uint "$value" && runtime_wifi0_temp="$value" ;;
+			wifi1_temp) is_uint "$value" && runtime_wifi1_temp="$value" ;;
+			cpu_state) is_state "$value" && runtime_cpu_state="$value" ;;
+			aqr_state) is_state "$value" && runtime_aqr_state="$value" ;;
+			wifi0_state) is_state "$value" && runtime_wifi0_state="$value" ;;
+			wifi1_state) is_state "$value" && runtime_wifi1_state="$value" ;;
+			desired_state) is_state "$value" && runtime_desired_state="$value" ;;
+			fan_state) is_state "$value" && runtime_fan_state="$value" ;;
+			cpu_failsafe) runtime_cpu_failsafe="$(bool_num "$value")" ;;
+			aqr_failsafe) runtime_aqr_failsafe="$(bool_num "$value")" ;;
+			wifi0_failsafe) runtime_wifi0_failsafe="$(bool_num "$value")" ;;
+			wifi1_failsafe) runtime_wifi1_failsafe="$(bool_num "$value")" ;;
+			pending_down_state) is_state "$value" && runtime_pending_state="$value" ;;
+			pending_down_count) is_uint "$value" && runtime_pending_count="$value" ;;
+			aqr_model) runtime_aqr_model="$value" ;;
+			aqr_driver) runtime_aqr_driver="$value" ;;
+			aqr_phy_id) runtime_aqr_phy_id="$value" ;;
+			aqr_mdio_address) runtime_aqr_mdio_address="$value" ;;
+			aqr_of_path) runtime_aqr_of_path="$value" ;;
+			aqr_netdev) runtime_aqr_netdev="$value" ;;
+			aqr_detection_method) runtime_aqr_detection_method="$value" ;;
+			aqr_temp_input) runtime_aqr_temp_input="$value" ;;
+			aqr_identity_warning) runtime_aqr_identity_warning="$value" ;;
+			router_model) runtime_router_model="$value" ;;
+			router_hw_revision) runtime_router_hw_revision="$value" ;;
+			router_pcb_revision) runtime_router_pcb_revision="$value" ;;
+			router_revision_confidence) runtime_router_revision_confidence="$value" ;;
+			router_revision_basis) runtime_router_revision_basis="$value" ;;
+		esac
+	done < "$RUNTIME"
+
+	is_state "$runtime_cpu_state" && \
+	is_state "$runtime_aqr_state" && \
+	is_state "$runtime_wifi0_state" && \
+	is_state "$runtime_wifi1_state" && runtime_available=1
+}
+
+collect_status() {
+	running=0
+	pid=''
+	if [ -r "$LOCK/pid" ]; then
+		pid="$(cat "$LOCK/pid" 2>/dev/null)"
+		if is_uint "$pid" && kill -0 "$pid" 2>/dev/null; then
+			running=1
+		else
+			pid=''
+		fi
+	fi
+
+	autostart=0
+	for link in /etc/rc.d/S??fan_monitor; do
+		[ -L "$link" ] || continue
+		autostart=1
+		break
+	done
+
+	fan_hwmon=''
+	fan_target=''
+	fan_input=''
+	fan_pwm=''
+	fan_state=''
+	cpu_temp=''
+	aqr_temp=''
+	wifi0_temp=''
+	wifi1_temp=''
+	cpu_sensor_count=0
+	thermal_total=0
+	thermal_enabled_count=0
+
+	fm_detect_fan_hwmon && fan_hwmon="$FAN_HWMON"
+	fm_detect_cpu_hwmon_paths || true
+	cpu_sensor_count="$CPU_SENSOR_COUNT"
+	for h in $CPU_HWMON_PATHS; do
+		if read_temp "$h/temp1_input"; then
+			if [ -z "$cpu_temp" ] || [ "$TEMP_VALUE" -gt "$cpu_temp" ]; then
+				cpu_temp="$TEMP_VALUE"
+			fi
+		fi
+	done
+
+	fm_detect_wifi_hwmon || true
+	[ -n "$WIFI0_HWMON" ] && read_temp "$WIFI0_HWMON/temp1_input" && wifi0_temp="$TEMP_VALUE"
+	[ -n "$WIFI1_HWMON" ] && read_temp "$WIFI1_HWMON/temp1_input" && wifi1_temp="$TEMP_VALUE"
+
+	aqr_hwmon=''
+	aqr_model=''
+	aqr_driver=''
+	aqr_phy_id=''
+	aqr_mdio_address=''
+	aqr_of_path=''
+	aqr_netdev=''
+	aqr_detection_method=''
+	aqr_temp_input=''
+	aqr_identity_warning=''
+	router_model='Asus RT-AX89X'
+	router_hw_revision='Unknown'
+	router_pcb_revision='Unknown'
+	router_revision_confidence='none'
+	router_revision_basis='AQR-family PHY was not detected'
+
+	if fm_detect_aqr_hwmon; then
+		aqr_hwmon="$AQR_HWMON"
+		aqr_temp_input="$AQR_TEMP_INPUT"
+		aqr_model="$AQR_MODEL"
+		aqr_driver="$AQR_DRIVER"
+		aqr_phy_id="$AQR_PHY_ID"
+		aqr_mdio_address="$AQR_MDIO_ADDRESS"
+		aqr_of_path="$AQR_OF_PATH"
+		aqr_netdev="$AQR_ATTACHED_NETDEV"
+		aqr_detection_method="$AQR_DETECTION_METHOD"
+		aqr_identity_warning="$AQR_IDENTITY_WARNING"
+		read_temp "$aqr_temp_input" && aqr_temp="$TEMP_VALUE"
+		fm_infer_router_revision || true
+		router_hw_revision="$ROUTER_HW_REVISION"
+		router_pcb_revision="$ROUTER_PCB_REVISION"
+		router_revision_confidence="$ROUTER_REVISION_CONFIDENCE"
+		router_revision_basis="$ROUTER_REVISION_BASIS"
+	fi
+	fm_detect_router_model
+	router_model="$ROUTER_MODEL"
+
+	if [ -n "$fan_hwmon" ]; then
+		fan_target="$(cat "$fan_hwmon/fan1_target" 2>/dev/null)"
+		fan_input="$(cat "$fan_hwmon/fan1_input" 2>/dev/null)"
+		fan_pwm="$(cat "$fan_hwmon/pwm1" 2>/dev/null)"
+	fi
+
+	off_rpm="$(uci_value off_rpm 0)"
+	low_rpm="$(uci_value low_rpm 1600)"
+	mid_rpm="$(uci_value mid_rpm 1850)"
+	max_rpm="$(uci_value max_rpm 2100)"
+	case "$fan_target" in
+		"$off_rpm") fan_state=0 ;;
+		"$low_rpm") fan_state=1 ;;
+		"$mid_rpm") fan_state=2 ;;
+		"$max_rpm") fan_state=3 ;;
+		*) fan_state='' ;;
+	esac
+
+	cpu_low="$(uci_temp_mdeg cpu_low_up 62)"
+	cpu_mid="$(uci_temp_mdeg cpu_mid_up 66)"
+	cpu_max="$(uci_temp_mdeg cpu_max_up 70)"
+	aqr_low="$(uci_temp_mdeg aqr_low_up 65)"
+	aqr_mid="$(uci_temp_mdeg aqr_mid_up 74)"
+	aqr_max="$(uci_temp_mdeg aqr_max_up 80)"
+	wifi_low="$(uci_temp_mdeg wifi_low_up 68)"
+	wifi_mid="$(uci_temp_mdeg wifi_mid_up 73)"
+	wifi_max="$(uci_temp_mdeg wifi_max_up 78)"
+	downshift_intervals="$(uci_value downshift_intervals 4)"
+	is_uint "$downshift_intervals" || downshift_intervals=4
+
+	load_runtime
+
+	# Prefer the controller's filtered values and exact hysteretic states while
+	# it is running. Fall back to the current raw temperature bands otherwise.
+	if [ "$running" -eq 1 ] && [ "$runtime_available" -eq 1 ]; then
+		[ -n "$runtime_cpu_temp" ] && cpu_temp="$runtime_cpu_temp"
+		[ -n "$runtime_aqr_temp" ] && aqr_temp="$runtime_aqr_temp"
+		[ -n "$runtime_wifi0_temp" ] && wifi0_temp="$runtime_wifi0_temp"
+		[ -n "$runtime_wifi1_temp" ] && wifi1_temp="$runtime_wifi1_temp"
+		cpu_request="$runtime_cpu_state"
+		aqr_request="$runtime_aqr_state"
+		wifi0_request="$runtime_wifi0_state"
+		wifi1_request="$runtime_wifi1_state"
+		desired_state="$runtime_desired_state"
+		pending_state="$runtime_pending_state"
+		pending_count="$runtime_pending_count"
+		cpu_failsafe="$runtime_cpu_failsafe"
+		aqr_failsafe="$runtime_aqr_failsafe"
+		wifi0_failsafe="$runtime_wifi0_failsafe"
+		wifi1_failsafe="$runtime_wifi1_failsafe"
+		[ -n "$runtime_aqr_model" ] && aqr_model="$runtime_aqr_model"
+		[ -n "$runtime_aqr_driver" ] && aqr_driver="$runtime_aqr_driver"
+		[ -n "$runtime_aqr_phy_id" ] && aqr_phy_id="$runtime_aqr_phy_id"
+		[ -n "$runtime_aqr_mdio_address" ] && aqr_mdio_address="$runtime_aqr_mdio_address"
+		[ -n "$runtime_aqr_of_path" ] && aqr_of_path="$runtime_aqr_of_path"
+		[ -n "$runtime_aqr_netdev" ] && aqr_netdev="$runtime_aqr_netdev"
+		[ -n "$runtime_aqr_detection_method" ] && aqr_detection_method="$runtime_aqr_detection_method"
+		[ -n "$runtime_aqr_temp_input" ] && aqr_temp_input="$runtime_aqr_temp_input"
+		[ -n "$runtime_aqr_identity_warning" ] && aqr_identity_warning="$runtime_aqr_identity_warning"
+		[ -n "$runtime_router_model" ] && router_model="$runtime_router_model"
+		[ -n "$runtime_router_hw_revision" ] && router_hw_revision="$runtime_router_hw_revision"
+		[ -n "$runtime_router_pcb_revision" ] && router_pcb_revision="$runtime_router_pcb_revision"
+		[ -n "$runtime_router_revision_confidence" ] && router_revision_confidence="$runtime_router_revision_confidence"
+		[ -n "$runtime_router_revision_basis" ] && router_revision_basis="$runtime_router_revision_basis"
+	elif [ "$running" -eq 1 ]; then
+		# During the first sampling interval, derive provisional requests from
+		# the configured upward thresholds until runtime state is published.
+		band_state "$cpu_temp" "$cpu_low" "$cpu_mid" "$cpu_max" && cpu_request="$BAND_STATE" || cpu_request=''
+		band_state "$aqr_temp" "$aqr_low" "$aqr_mid" "$aqr_max" && aqr_request="$BAND_STATE" || aqr_request=''
+		band_state "$wifi0_temp" "$wifi_low" "$wifi_mid" "$wifi_max" && wifi0_request="$BAND_STATE" || wifi0_request=''
+		band_state "$wifi1_temp" "$wifi_low" "$wifi_mid" "$wifi_max" && wifi1_request="$BAND_STATE" || wifi1_request=''
+		max_request_state "$cpu_request" "$aqr_request" "$wifi0_request" "$wifi1_request"
+		desired_state="$MAX_REQUEST_STATE"
+		pending_state=''
+		pending_count=0
+		cpu_failsafe=0
+		aqr_failsafe=0
+		wifi0_failsafe=0
+		wifi1_failsafe=0
+	else
+		cpu_request=''
+		aqr_request=''
+		wifi0_request=''
+		wifi1_request=''
+		desired_state=''
+		pending_state=''
+		pending_count=0
+		cpu_failsafe=0
+		aqr_failsafe=0
+		wifi0_failsafe=0
+		wifi1_failsafe=0
+	fi
+
+	for zone in "$THERMAL_CLASS_ROOT"/thermal_zone*; do
+		[ -d "$zone" ] || continue
+		type="$(cat "$zone/type" 2>/dev/null)"
+		case "$type" in
+			cpu[0-9]*-thermal|cluster-thermal|cpu-thermal)
+				thermal_total=$((thermal_total + 1))
+				[ "$(cat "$zone/mode" 2>/dev/null)" = enabled ] && \
+					thermal_enabled_count=$((thermal_enabled_count + 1))
+				;;
+		esac
+	done
+
+	thermal_ok=0
+	[ "$thermal_total" -gt 0 ] && [ "$thermal_enabled_count" -eq "$thermal_total" ] && thermal_ok=1
+}
+
+json_add_number_or_na() {
+	local key="$1" value="$2"
+	if is_uint "$value"; then
+		json_add_int "$key" "$value"
+	else
+		json_add_string "$key" "NA"
+	fi
+}
+
+json_add_state_or_na() {
+	local key="$1" value="$2"
+	if is_state "$value"; then
+		json_add_int "$key" "$value"
+	else
+		json_add_string "$key" "NA"
+	fi
+}
+
+emit_status() {
+	collect_status
+	json_init
+	json_add_boolean running "$running"
+	json_add_boolean autostart "$autostart"
+	if is_uint "$pid"; then json_add_int pid "$pid"; else json_add_string pid "NA"; fi
+
+	json_add_object fan
+	json_add_number_or_na target "$fan_target"
+	json_add_number_or_na input "$fan_input"
+	json_add_number_or_na pwm "$fan_pwm"
+	json_add_state_or_na state "$fan_state"
+	json_add_state_or_na desired_state "$desired_state"
+	json_close_object
+
+	json_add_object hardware
+	json_add_string model "${router_model:-Asus RT-AX89X}"
+	json_add_string revision "${router_hw_revision:-Unknown}"
+	json_add_string pcb_revision "${router_pcb_revision:-Unknown}"
+	json_add_string confidence "${router_revision_confidence:-none}"
+	json_add_string basis "${router_revision_basis:-Unavailable}"
+	json_close_object
+
+	json_add_object aqr
+	json_add_string model "${aqr_model:-Unknown}"
+	json_add_string driver "${aqr_driver:-Unknown}"
+	json_add_string phy_id "${aqr_phy_id:-Unknown}"
+	json_add_string mdio_address "${aqr_mdio_address:-Unknown}"
+	json_add_string of_path "${aqr_of_path:-Unknown}"
+	json_add_string netdev "${aqr_netdev:-Unknown}"
+	json_add_string detection_method "${aqr_detection_method:-Unknown}"
+	json_add_string temp_input "${aqr_temp_input:-Unknown}"
+	json_add_string identity_warning "${aqr_identity_warning:-}"
+	json_close_object
+
+	json_add_object temperatures
+	json_add_number_or_na cpu "$cpu_temp"
+	json_add_number_or_na aqr113c "$aqr_temp"
+	json_add_number_or_na wifi0 "$wifi0_temp"
+	json_add_number_or_na wifi1 "$wifi1_temp"
+	json_close_object
+
+	json_add_object requests
+	json_add_state_or_na cpu "$cpu_request"
+	json_add_state_or_na aqr113c "$aqr_request"
+	json_add_state_or_na wifi0 "$wifi0_request"
+	json_add_state_or_na wifi1 "$wifi1_request"
+	json_add_state_or_na desired "$desired_state"
+	json_close_object
+
+	json_add_object failsafe
+	json_add_boolean cpu "$cpu_failsafe"
+	json_add_boolean aqr113c "$aqr_failsafe"
+	json_add_boolean wifi0 "$wifi0_failsafe"
+	json_add_boolean wifi1 "$wifi1_failsafe"
+	json_close_object
+
+	json_add_object thresholds
+	json_add_object cpu
+	json_add_int low "$cpu_low"
+	json_add_int medium "$cpu_mid"
+	json_add_int maximum "$cpu_max"
+	json_close_object
+	json_add_object aqr113c
+	json_add_int low "$aqr_low"
+	json_add_int medium "$aqr_mid"
+	json_add_int maximum "$aqr_max"
+	json_close_object
+	json_add_object wifi
+	json_add_int low "$wifi_low"
+	json_add_int medium "$wifi_mid"
+	json_add_int maximum "$wifi_max"
+	json_close_object
+	json_close_object
+
+	json_add_object control
+	json_add_state_or_na pending_state "$pending_state"
+	json_add_number_or_na pending_count "$pending_count"
+	json_add_int downshift_intervals "$downshift_intervals"
+	json_close_object
+
+	json_add_object sensors
+	json_add_int cpu_count "$cpu_sensor_count"
+	json_add_boolean fan_found "$([ -n "$fan_hwmon" ] && echo 1 || echo 0)"
+	json_add_boolean aqr_found "$([ -n "$aqr_hwmon" ] && echo 1 || echo 0)"
+	json_add_boolean wifi0_found "$([ -n "$wifi0_temp" ] && echo 1 || echo 0)"
+	json_add_boolean wifi1_found "$([ -n "$wifi1_temp" ] && echo 1 || echo 0)"
+	json_close_object
+
+	json_add_object thermal
+	json_add_boolean protected "$thermal_ok"
+	json_add_int enabled "$thermal_enabled_count"
+	json_add_int total "$thermal_total"
+	json_close_object
+
+	[ -n "$ACTION_NAME" ] && json_add_string action "$ACTION_NAME"
+	[ -n "$ACTION_CODE" ] && json_add_int code "$ACTION_CODE"
+	json_dump
+}
+
+perform_action() {
+	local request requested rc=1 was_running=0
+	request="$(cat)"
+	json_load "$request" 2>/dev/null || true
+	json_get_var requested action
+
+	collect_status
+	was_running="$running"
+
+	case "$requested" in
+		start|stop|restart|enable|disable)
+			"$INIT" "$requested" >/dev/null 2>&1
+			rc=$?
+			;;
+		apply)
+			if [ "$was_running" -eq 1 ]; then
+				"$INIT" restart >/dev/null 2>&1
+				rc=$?
+			else
+				rc=0
+			fi
+			;;
+		*)
+			requested=invalid
+			rc=2
+			;;
+	esac
+
+	case "$requested" in start|stop|restart|apply) sleep 1 ;; esac
+	ACTION_NAME="$requested"
+	ACTION_CODE="$rc"
+	emit_status
+}
+
+case "$1" in
+	list)
+		echo '{"status":{},"action":{"action":"string"}}'
+		;;
+	call)
+		case "$2" in
+			status) emit_status ;;
+			action) perform_action ;;
+			*) exit 1 ;;
+		esac
+		;;
+	*)
+		exit 1
+		;;
+esac
