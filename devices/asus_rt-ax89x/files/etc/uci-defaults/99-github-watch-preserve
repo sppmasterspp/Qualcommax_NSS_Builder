@@ -1,0 +1,19 @@
+#!/bin/sh
+
+# Ensure GitHub Watch settings and secrets are included in normal OpenWrt
+# sysupgrade backups when "Keep settings" is enabled.
+
+SYSUPGRADE_CONF='/etc/sysupgrade.conf'
+
+touch "$SYSUPGRADE_CONF" || exit 1
+
+for path in \
+    '/etc/github-watch.conf' \
+    '/etc/github-watch/' \
+    '/etc/crontabs/root'
+do
+    grep -qxF "$path" "$SYSUPGRADE_CONF" 2>/dev/null ||
+        printf '%s\n' "$path" >> "$SYSUPGRADE_CONF"
+done
+
+exit 0

@@ -1,0 +1,110 @@
+#!/bin/sh
+
+# Secure interactive Telegram token installer for OpenWrt / BusyBox ash.
+# The token is read without terminal echo and written atomically with mode 600.
+
+TAG='github-watch'
+CONFIG_FILE="${CONFIG_FILE:-/etc/github-watch.conf}"
+DEFAULT_TOKEN_FILE='/etc/github-watch/telegram.token'
+
+fail() {
+    logger -t "$TAG" "Token setup error: $*"
+    printf 'Error: %s\n' "$*" >&2
+    exit 1
+}
+
+TOKEN_FILE="$DEFAULT_TOKEN_FILE"
+
+# Return numeric owner UID. Prefer stat, but fall back to standard BusyBox ls/awk
+# because some compact OpenWrt builds do not include the stat applet.
+get_owner_uid() {
+    metadata_path=$1
+
+    if command -v stat >/dev/null 2>&1; then
+        stat -c '%u' "$metadata_path" 2>/dev/null && return 0
+    fi
+
+    if command -v busybox >/dev/null 2>&1 &&
+       busybox stat -c '%u' "$metadata_path" >/dev/null 2>&1; then
+        busybox stat -c '%u' "$metadata_path" 2>/dev/null && return 0
+    fi
+
+    LC_ALL=C ls -ldn "$metadata_path" 2>/dev/null |
+        awk 'NR == 1 { print $3; found=1 } END { exit !found }'
+}
+
+# Return the permissions needed by this package. The ls fallback deliberately
+# recognizes only the strict private modes accepted here.
+get_private_mode() {
+    metadata_path=$1
+
+    if command -v stat >/dev/null 2>&1; then
+        stat -c '%a' "$metadata_path" 2>/dev/null && return 0
+    fi
+
+    if command -v busybox >/dev/null 2>&1 &&
+       busybox stat -c '%a' "$metadata_path" >/dev/null 2>&1; then
+        busybox stat -c '%a' "$metadata_path" 2>/dev/null && return 0
+    fi
+
+    permission_text=$(LC_ALL=C ls -ld "$metadata_path" 2>/dev/null |
+        awk 'NR == 1 { print $1; found=1 } END { exit !found }') || return 1
+
+    case "$permission_text" in
+        -r--------) printf '%s\n' 400 ;;
+        -rw-------) printf '%s\n' 600 ;;
+        drwx------) printf '%s\n' 700 ;;
+        *) printf '%s\n' "$permission_text" ;;
+    esac
+}
+
+# Read TOKEN_FILE from the private root-owned configuration when available.
+if [ -f "$CONFIG_FILE" ] && [ ! -L "$CONFIG_FILE" ]; then
+    owner_uid=$(get_owner_uid "$CONFIG_FILE") ||
+        fail "cannot inspect owner of $CONFIG_FILE"
+    mode=$(get_private_mode "$CONFIG_FILE") ||
+        fail "cannot inspect permissions of $CONFIG_FILE"
+
+    [ "$owner_uid" = '0' ] || fail "$CONFIG_FILE must be owned by root"
+    case "$mode" in
+        400|600) ;;
+        *) fail "$CONFIG_FILE must have mode 400 or 600, not $mode" ;;
+    esac
+
+    # shellcheck source=/dev/null
+    . "$CONFIG_FILE"
+    TOKEN_FILE="${TOKEN_FILE:-$DEFAULT_TOKEN_FILE}"
+fi
+
+TOKEN_DIR=$(dirname "$TOKEN_FILE")
+umask 077
+
+mkdir -p "$TOKEN_DIR" || fail "cannot create $TOKEN_DIR"
+chown root:root "$TOKEN_DIR" || fail "cannot set ownership on $TOKEN_DIR"
+chmod 700 "$TOKEN_DIR" || fail "cannot protect $TOKEN_DIR"
+
+[ -t 0 ] || fail 'run this command from an interactive SSH terminal'
+
+printf 'Paste the new Telegram bot token (input is hidden): ' >&2
+IFS= read -r -s NEW_TOKEN
+read_status=$?
+printf '\n' >&2
+[ "$read_status" -eq 0 ] || fail 'could not read the token'
+
+printf '%s\n' "$NEW_TOKEN" | grep -Eq '^[0-9]+:[A-Za-z0-9_-]{20,}$' || {
+    unset NEW_TOKEN
+    fail 'the token format is invalid'
+}
+
+TMP_FILE="${TOKEN_FILE}.new.$$"
+trap 'rm -f "$TMP_FILE"; unset NEW_TOKEN' EXIT HUP INT TERM
+
+printf '%s\n' "$NEW_TOKEN" > "$TMP_FILE" || fail 'cannot write the temporary token file'
+chown root:root "$TMP_FILE" || fail 'cannot set token ownership'
+chmod 600 "$TMP_FILE" || fail 'cannot protect the token file'
+mv -f "$TMP_FILE" "$TOKEN_FILE" || fail 'cannot install the token file'
+unset NEW_TOKEN
+trap - EXIT HUP INT TERM
+
+printf 'Telegram token installed securely in %s\n' "$TOKEN_FILE"
+printf 'Next run: /usr/bin/github-watch --check-config\n'

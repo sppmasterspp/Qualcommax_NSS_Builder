@@ -1,0 +1,476 @@
+#!/bin/sh
+
+# telegram-warn-v3.1
+# Monitor the OpenWrt system log and send selected events to Telegram.
+# Reuses the protected Telegram settings already configured for github-watch:
+#   CHAT_ID   from /etc/github-watch.conf
+#   bot token from TOKEN_FILE (normally /etc/github-watch/telegram.token)
+
+PROGRAM=${0##*/}
+LOG_TAG="telegram-warn"
+
+CONFIG_FILE=${CONFIG_FILE:-/etc/github-watch.conf}
+DEFAULT_TOKEN_FILE='/etc/github-watch/telegram.token'
+STATE_FILE=${STATE_FILE:-/tmp/telegram-warn.state}
+LOCK_DIR=${LOCK_DIR:-/var/run/telegram-warn.lock}
+
+# Safe defaults. These may be overridden in the configuration file.
+STATE_MAX_ENTRIES=500
+MAX_MATCHES_PER_PATTERN=3
+MAX_ALERTS_PER_RUN=10
+MAX_LOG_CHARS=3000
+CURL_CONNECT_TIMEOUT=10
+CURL_MAX_TIME=20
+SEND_INTERVAL_SECONDS=1
+SEND_EXISTING_ON_FIRST_RUN=1
+
+MODE="run"
+LOCK_HELD=0
+WORK_DIR=""
+TELEGRAM_CURL_CONFIG=""
+
+umask 077
+
+log_message() {
+    logger -t "$LOG_TAG" "$*" 2>/dev/null || :
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM" "$*" >&2
+    log_message "$*"
+    exit 1
+}
+
+show_help() {
+    cat <<EOF
+Usage: $PROGRAM [OPTION]
+
+Options:
+  --test          Send one normal Telegram test notification.
+  --check         Validate configuration and dependencies only.
+  --dry-run       Show new alerts without sending or changing state.
+  -h, --help      Show this help.
+
+Environment overrides:
+  CONFIG_FILE     Shared github-watch configuration (default: /etc/github-watch.conf)
+  STATE_FILE      State path (default: /tmp/telegram-warn.state)
+  LOCK_DIR        Lock directory (default: /var/run/telegram-warn.lock)
+EOF
+}
+
+case "${1:-}" in
+    "") ;;
+    --test) MODE="test" ;;
+    --check) MODE="check" ;;
+    --dry-run) MODE="dry-run" ;;
+    -h|--help)
+        show_help
+        exit 0
+        ;;
+    *)
+        show_help >&2
+        exit 2
+        ;;
+esac
+
+is_uint() {
+    case "$1" in
+        ""|*[!0-9]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+validate_private_file() {
+    PRIVATE_FILE=$1
+    PRIVATE_DESCRIPTION=$2
+
+    [ -f "$PRIVATE_FILE" ] || fail "$PRIVATE_DESCRIPTION is missing: $PRIVATE_FILE"
+    [ -r "$PRIVATE_FILE" ] || fail "$PRIVATE_DESCRIPTION is not readable: $PRIVATE_FILE"
+    [ ! -L "$PRIVATE_FILE" ] || fail "$PRIVATE_DESCRIPTION must not be a symbolic link: $PRIVATE_FILE"
+
+    # Some minimal OpenWrt images do not provide the BusyBox `stat` applet.
+    # `ls -ldn` is part of the standard BusyBox `ls` applet and gives both
+    # symbolic permissions and the numeric owner without following symlinks.
+    PRIVATE_DETAILS=$(LC_ALL=C ls -ldn "$PRIVATE_FILE" 2>/dev/null) || \
+        fail "cannot inspect $PRIVATE_FILE with ls -ldn"
+
+    # Long listing fields begin with: mode links uid gid ...
+    set -- $PRIVATE_DETAILS
+    PRIVATE_PERMISSIONS=${1:-}
+    PRIVATE_OWNER=${3:-}
+
+    [ "$PRIVATE_OWNER" = "0" ] || \
+        fail "$PRIVATE_FILE must be owned by root; current owner UID is ${PRIVATE_OWNER:-unknown}"
+
+    case "$PRIVATE_PERMISSIONS" in
+        -r--------|-rw-------) ;;
+        *)
+            fail "$PRIVATE_FILE must have permissions 600 or 400; current permissions are ${PRIVATE_PERMISSIONS:-unknown}"
+            ;;
+    esac
+}
+
+load_config() {
+    validate_private_file "$CONFIG_FILE" "configuration file"
+
+    # This root-only file is shared with github-watch and intentionally uses
+    # shell assignment syntax. Only CHAT_ID and TOKEN_FILE are consumed here.
+    # shellcheck disable=SC1090
+    . "$CONFIG_FILE"
+
+    TOKEN_FILE=${TOKEN_FILE:-$DEFAULT_TOKEN_FILE}
+    CHAT_ID=${CHAT_ID:-}
+
+    case "$TOKEN_FILE" in
+        /*) ;;
+        *) fail "TOKEN_FILE must be an absolute path in $CONFIG_FILE" ;;
+    esac
+
+    case "$CHAT_ID" in
+        ""|CHANGE_ME|YOUR_CHAT_ID_HERE)
+            fail "CHAT_ID is not configured in $CONFIG_FILE"
+            ;;
+    esac
+
+    printf '%s\n' "$CHAT_ID" | grep -Eq '^-?[0-9]+$' || \
+        fail "CHAT_ID has an invalid format in $CONFIG_FILE"
+
+    validate_private_file "$TOKEN_FILE" "Telegram token file"
+
+    BOT_TOKEN=""
+    IFS= read -r BOT_TOKEN < "$TOKEN_FILE" || {
+        [ -n "$BOT_TOKEN" ] || fail "cannot read Telegram token from $TOKEN_FILE"
+    }
+
+    case "$BOT_TOKEN" in
+        ""|CHANGE_ME|YOUR_TOKEN_HERE|*"<"*|*">"*)
+            fail "Telegram token is not configured in $TOKEN_FILE"
+            ;;
+    esac
+
+    printf '%s\n' "$BOT_TOKEN" | \
+        grep -Eq '^[0-9]+:[A-Za-z0-9_-]{20,}$' || \
+        fail "Telegram token has an invalid format in $TOKEN_FILE"
+
+    for VALUE_NAME in \
+        STATE_MAX_ENTRIES MAX_MATCHES_PER_PATTERN MAX_ALERTS_PER_RUN \
+        MAX_LOG_CHARS CURL_CONNECT_TIMEOUT CURL_MAX_TIME \
+        SEND_INTERVAL_SECONDS SEND_EXISTING_ON_FIRST_RUN
+    do
+        eval "VALUE=\${$VALUE_NAME}"
+        is_uint "$VALUE" || fail "$VALUE_NAME must be a non-negative integer"
+    done
+
+    [ "$STATE_MAX_ENTRIES" -gt 0 ] || fail "STATE_MAX_ENTRIES must be greater than zero"
+    [ "$MAX_MATCHES_PER_PATTERN" -gt 0 ] || fail "MAX_MATCHES_PER_PATTERN must be greater than zero"
+    [ "$MAX_ALERTS_PER_RUN" -gt 0 ] || fail "MAX_ALERTS_PER_RUN must be greater than zero"
+    [ "$MAX_LOG_CHARS" -ge 100 ] || fail "MAX_LOG_CHARS must be at least 100"
+
+    case "$SEND_EXISTING_ON_FIRST_RUN" in
+        0|1) ;;
+        *) fail "SEND_EXISTING_ON_FIRST_RUN must be 0 or 1" ;;
+    esac
+}
+
+check_dependencies() {
+    REQUIRED_COMMANDS="curl grep tail wc cut md5sum mktemp ls logger"
+
+    if [ "$MODE" = "run" ] || [ "$MODE" = "dry-run" ]; then
+        REQUIRED_COMMANDS="$REQUIRED_COMMANDS logread"
+    fi
+
+    for COMMAND_NAME in $REQUIRED_COMMANDS; do
+        command -v "$COMMAND_NAME" >/dev/null 2>&1 || \
+            fail "required command is missing: $COMMAND_NAME"
+    done
+}
+
+cleanup() {
+    if [ -n "$WORK_DIR" ] && [ -d "$WORK_DIR" ]; then
+        rm -rf "$WORK_DIR"
+    fi
+
+    if [ "$LOCK_HELD" -eq 1 ] && [ -d "$LOCK_DIR" ]; then
+        rm -rf "$LOCK_DIR"
+    fi
+}
+
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+acquire_lock() {
+    LOCK_PARENT=${LOCK_DIR%/*}
+    [ "$LOCK_PARENT" != "$LOCK_DIR" ] || LOCK_PARENT="."
+    [ -d "$LOCK_PARENT" ] || fail "lock parent directory is missing: $LOCK_PARENT"
+
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        LOCK_HELD=1
+        printf '%s\n' "$$" > "$LOCK_DIR/pid"
+        return 0
+    fi
+
+    OLD_PID=""
+    if [ -r "$LOCK_DIR/pid" ]; then
+        IFS= read -r OLD_PID < "$LOCK_DIR/pid" || OLD_PID=""
+    fi
+
+    case "$OLD_PID" in
+        ""|*[!0-9]*) ;;
+        *)
+            if kill -0 "$OLD_PID" 2>/dev/null; then
+                fail "another instance is already running with PID $OLD_PID"
+            fi
+            ;;
+    esac
+
+    # Remove only a stale lock directory owned by the previous run.
+    [ -d "$LOCK_DIR" ] || fail "cannot use lock path: $LOCK_DIR"
+    rm -rf "$LOCK_DIR" || fail "cannot remove stale lock: $LOCK_DIR"
+    mkdir "$LOCK_DIR" 2>/dev/null || fail "cannot create lock: $LOCK_DIR"
+
+    LOCK_HELD=1
+    printf '%s\n' "$$" > "$LOCK_DIR/pid"
+    log_message "Removed stale lock${OLD_PID:+ from PID $OLD_PID}"
+}
+
+prepare_work_dir() {
+    WORK_DIR=$(mktemp -d /tmp/telegram-warn.XXXXXX) || \
+        fail "cannot create temporary working directory"
+
+    # Keep the token out of curl's command-line arguments and process listing.
+    TELEGRAM_CURL_CONFIG="$WORK_DIR/telegram-curl.conf"
+    printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' \
+        "$BOT_TOKEN" > "$TELEGRAM_CURL_CONFIG" || \
+        fail "cannot create protected Telegram curl configuration"
+    chmod 600 "$TELEGRAM_CURL_CONFIG" || \
+        fail "cannot protect Telegram curl configuration"
+    unset BOT_TOKEN
+}
+
+get_hostname() {
+    ROUTER_HOSTNAME="unknown"
+    if [ -r /proc/sys/kernel/hostname ]; then
+        IFS= read -r ROUTER_HOSTNAME < /proc/sys/kernel/hostname || ROUTER_HOSTNAME="unknown"
+    fi
+    ROUTER_HOSTNAME=${ROUTER_HOSTNAME%%:*}
+    [ -n "$ROUTER_HOSTNAME" ] || ROUTER_HOSTNAME="unknown"
+}
+
+send_telegram() {
+    MESSAGE_TEXT=$1
+    SILENT_NOTIFICATION=${2:-0}
+
+    MESSAGE_FILE="$WORK_DIR/message.txt"
+    RESPONSE_FILE="$WORK_DIR/response.json"
+
+    printf '%s' "$MESSAGE_TEXT" > "$MESSAGE_FILE" || return 1
+    : > "$RESPONSE_FILE" || return 1
+
+    HTTP_CODE=$(curl \
+        --config "$TELEGRAM_CURL_CONFIG" \
+        --silent \
+        --show-error \
+        --connect-timeout "$CURL_CONNECT_TIMEOUT" \
+        --max-time "$CURL_MAX_TIME" \
+        --output "$RESPONSE_FILE" \
+        --write-out '%{http_code}' \
+        --request POST \
+        --data-urlencode "chat_id=$CHAT_ID" \
+        --data-urlencode "text@$MESSAGE_FILE" \
+        --data "disable_notification=$SILENT_NOTIFICATION")
+    CURL_STATUS=$?
+
+    if [ "$CURL_STATUS" -ne 0 ]; then
+        log_message "Telegram request failed: curl exit code $CURL_STATUS"
+        return 1
+    fi
+
+    if [ "$HTTP_CODE" != "200" ]; then
+        log_message "Telegram request failed: HTTP $HTTP_CODE"
+        return 1
+    fi
+
+    if ! grep -Eq '"ok"[[:space:]]*:[[:space:]]*true' "$RESPONSE_FILE"; then
+        log_message "Telegram API returned an unsuccessful response"
+        return 1
+    fi
+
+    return 0
+}
+
+hash_log_line() {
+    printf '%s\n' "$1" | md5sum | cut -d ' ' -f 1
+}
+
+state_contains() {
+    grep -Fqx "$1" "$STATE_FILE" 2>/dev/null
+}
+
+state_add() {
+    printf '%s\n' "$1" >> "$STATE_FILE" || return 1
+}
+
+prune_state() {
+    STATE_LINES=$(wc -l < "$STATE_FILE" 2>/dev/null) || return 1
+    [ "$STATE_LINES" -le "$STATE_MAX_ENTRIES" ] && return 0
+
+    STATE_TMP="$WORK_DIR/state.tmp"
+    tail -n "$STATE_MAX_ENTRIES" "$STATE_FILE" > "$STATE_TMP" || return 1
+    mv "$STATE_TMP" "$STATE_FILE" || return 1
+    chmod 600 "$STATE_FILE" 2>/dev/null || :
+}
+
+icon_for_alert() {
+    case "$1" in
+        *Kernel*|*Segfault*) printf '%s' '🚨' ;;
+        *temperature*|*memory*) printf '%s' '🔥' ;;
+        *scheduler*|*Dnsmasq*|*warning*) printf '%s' '⚠️' ;;
+        *) printf '%s' 'ℹ️' ;;
+    esac
+}
+
+format_alert() {
+    ALERT_ICON=$1
+    ALERT_TEXT=$2
+    LOG_TEXT=$3
+
+    if [ "${#LOG_TEXT}" -gt "$MAX_LOG_CHARS" ]; then
+        LOG_TEXT=$(printf '%s' "$LOG_TEXT" | cut -c "1-$MAX_LOG_CHARS")
+        LOG_TEXT="$LOG_TEXT…"
+    fi
+
+    printf '%s %s\nRouter: %s\n\n%s' \
+        "$ALERT_ICON" "$ALERT_TEXT" "$ROUTER_HOSTNAME" "$LOG_TEXT"
+}
+
+load_config
+check_dependencies
+get_hostname
+
+if [ "$MODE" = "check" ]; then
+    printf 'Shared configuration is valid: %s\n' "$CONFIG_FILE"
+    printf 'Telegram token file is valid: %s\n' "$TOKEN_FILE"
+    printf 'Router hostname: %s\n' "$ROUTER_HOSTNAME"
+    exit 0
+fi
+
+acquire_lock
+prepare_work_dir
+
+if [ "$MODE" = "test" ]; then
+    TEST_MESSAGE=$(printf '✅ Telegram warning test\nRouter: %s\n\nConfiguration and Telegram delivery are working.' \
+        "$ROUTER_HOSTNAME")
+
+    if send_telegram "$TEST_MESSAGE" 0; then
+        printf 'Telegram test notification sent successfully.\n'
+        log_message "Test notification sent successfully"
+        exit 0
+    fi
+
+    fail "Telegram test notification failed"
+fi
+
+[ ! -L "$STATE_FILE" ] || fail "state file must not be a symbolic link: $STATE_FILE"
+
+FIRST_RUN=0
+if [ ! -e "$STATE_FILE" ]; then
+    FIRST_RUN=1
+fi
+
+[ -f "$STATE_FILE" ] || : > "$STATE_FILE" || fail "cannot create state file: $STATE_FILE"
+chmod 600 "$STATE_FILE" 2>/dev/null || :
+
+LOG_FILE="$WORK_DIR/system.log"
+LOGREAD_ERROR_FILE="$WORK_DIR/logread.error"
+MATCH_FILE="$WORK_DIR/matches.log"
+
+if ! logread > "$LOG_FILE" 2> "$LOGREAD_ERROR_FILE"; then
+    fail "cannot read the OpenWrt system log"
+fi
+
+ALERTS_PROCESSED=0
+ALERTS_SENT=0
+STOP_PROCESSING=0
+
+# Pattern format: regular_expression|alert_text|silent_flag
+# silent_flag: 1 = silent Telegram notification, 0 = normal notification
+while IFS='|' read -r PATTERN ALERT_TEXT SILENT_FLAG; do
+    [ -n "$PATTERN" ] || continue
+    [ "$STOP_PROCESSING" -eq 0 ] || break
+
+    case "$SILENT_FLAG" in
+        1) DISABLE_NOTIFICATION=true ;;
+        *) DISABLE_NOTIFICATION=false ;;
+    esac
+
+    # Scan all matching records. The per-pattern and global limits apply only
+    # to new records, so older unseen events are handled on a later run.
+    grep -Ei "$PATTERN" "$LOG_FILE" 2>/dev/null > "$MATCH_FILE" || :
+    PATTERN_ALERTS=0
+
+    while IFS= read -r LOG_LINE || [ -n "$LOG_LINE" ]; do
+        [ -n "$LOG_LINE" ] || continue
+
+        LOG_HASH=$(hash_log_line "$LOG_LINE")
+        [ -n "$LOG_HASH" ] || continue
+        state_contains "$LOG_HASH" && continue
+
+        if [ "$FIRST_RUN" -eq 1 ] && [ "$SEND_EXISTING_ON_FIRST_RUN" -eq 0 ]; then
+            state_add "$LOG_HASH" || fail "cannot update state file: $STATE_FILE"
+            continue
+        fi
+
+        ALERT_ICON=$(icon_for_alert "$ALERT_TEXT")
+        [ "$SILENT_FLAG" = "1" ] && ALERT_ICON="🔇$ALERT_ICON"
+        MESSAGE=$(format_alert "$ALERT_ICON" "$ALERT_TEXT" "$LOG_LINE")
+
+        if [ "$MODE" = "dry-run" ]; then
+            printf '%s\n---\n' "$MESSAGE"
+            PATTERN_ALERTS=$((PATTERN_ALERTS + 1))
+            [ "$PATTERN_ALERTS" -ge "$MAX_MATCHES_PER_PATTERN" ] && break
+            continue
+        fi
+
+        ALERTS_PROCESSED=$((ALERTS_PROCESSED + 1))
+        PATTERN_ALERTS=$((PATTERN_ALERTS + 1))
+
+        if send_telegram "$MESSAGE" "$DISABLE_NOTIFICATION"; then
+            state_add "$LOG_HASH" || fail "cannot update state file: $STATE_FILE"
+            ALERTS_SENT=$((ALERTS_SENT + 1))
+            log_message "Sent: $ALERT_TEXT"
+
+            if [ "$SEND_INTERVAL_SECONDS" -gt 0 ]; then
+                sleep "$SEND_INTERVAL_SECONDS"
+            fi
+        else
+            log_message "Failed to send: $ALERT_TEXT"
+        fi
+
+        if [ "$ALERTS_PROCESSED" -ge "$MAX_ALERTS_PER_RUN" ]; then
+            STOP_PROCESSING=1
+            log_message "Reached MAX_ALERTS_PER_RUN=$MAX_ALERTS_PER_RUN"
+            break
+        fi
+
+        if [ "$PATTERN_ALERTS" -ge "$MAX_MATCHES_PER_PATTERN" ]; then
+            break
+        fi
+    done < "$MATCH_FILE"
+done <<'PATTERNS'
+kernel panic|Kernel panic|0
+segfault|Segfault detected|0
+Out of memory|Out of memory|1
+temperature above threshold|High temperature warning|0
+sched: DL replenish lagged too much|CPU scheduler lag detected|1
+dnsmasq.*Error: No such file or directory|Dnsmasq error|1
+PATTERNS
+
+if [ "$MODE" != "dry-run" ]; then
+    prune_state || fail "cannot prune state file: $STATE_FILE"
+fi
+
+if [ "$ALERTS_SENT" -gt 0 ]; then
+    log_message "Completed: sent $ALERTS_SENT alert(s)"
+fi
+
+exit 0

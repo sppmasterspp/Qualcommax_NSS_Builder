@@ -1,0 +1,17 @@
+{
+	"luci-app-fan-monitor": {
+		"description": "Grant access to the RT-AX89X fan monitor",
+		"read": {
+			"ubus": {
+				"luci.fan-monitor": [ "status" ]
+			},
+			"uci": [ "fan_monitor" ]
+		},
+		"write": {
+			"ubus": {
+				"luci.fan-monitor": [ "action" ]
+			},
+			"uci": [ "fan_monitor" ]
+		}
+	}
+}

@@ -1,0 +1,138 @@
+#!/bin/sh /etc/rc.common
+
+USE_PROCD=1
+START=95
+STOP=10
+
+PROGRAM=/usr/sbin/fan_monitor
+CONFIG=fan_monitor
+RUNTIME_STATUS=/var/run/fan_monitor.status
+
+bool_word() {
+	[ "$1" = "1" ] && echo true || echo false
+}
+
+mdeg() {
+	case "$1" in
+		''|*[!0-9]*) echo "$1" ;;
+		*) echo "${1}000" ;;
+	esac
+}
+
+start_service() {
+	rm -f "$RUNTIME_STATUS" 2>/dev/null
+	config_load "$CONFIG"
+
+	local debug interval_sec downshift_intervals sensor_fail_limit enable_thermal_zones
+	local off_rpm low_rpm mid_rpm max_rpm
+	local cpu_low_up cpu_mid_up cpu_max_up cpu_low_down cpu_mid_down cpu_max_down
+	local aqr_low_up aqr_mid_up aqr_max_up aqr_low_down aqr_mid_down aqr_max_down
+	local wifi_low_up wifi_mid_up wifi_max_up wifi_low_down wifi_mid_down wifi_max_down
+
+	config_get_bool debug main debug 0
+	config_get interval_sec main interval_sec 15
+	config_get downshift_intervals main downshift_intervals 4
+	config_get sensor_fail_limit main sensor_fail_limit 3
+	config_get_bool enable_thermal_zones main enable_thermal_zones 1
+
+	config_get off_rpm main off_rpm 0
+	config_get low_rpm main low_rpm 1600
+	config_get mid_rpm main mid_rpm 1850
+	config_get max_rpm main max_rpm 2100
+
+	config_get cpu_low_up main cpu_low_up 62
+	config_get cpu_mid_up main cpu_mid_up 66
+	config_get cpu_max_up main cpu_max_up 70
+	config_get cpu_low_down main cpu_low_down 59
+	config_get cpu_mid_down main cpu_mid_down 63
+	config_get cpu_max_down main cpu_max_down 67
+
+	config_get aqr_low_up main aqr_low_up 65
+	config_get aqr_mid_up main aqr_mid_up 74
+	config_get aqr_max_up main aqr_max_up 80
+	config_get aqr_low_down main aqr_low_down 62
+	config_get aqr_mid_down main aqr_mid_down 72
+	config_get aqr_max_down main aqr_max_down 78
+
+	config_get wifi_low_up main wifi_low_up 68
+	config_get wifi_mid_up main wifi_mid_up 73
+	config_get wifi_max_up main wifi_max_up 78
+	config_get wifi_low_down main wifi_low_down 65
+	config_get wifi_mid_down main wifi_mid_down 70
+	config_get wifi_max_down main wifi_max_down 75
+
+	procd_open_instance
+	procd_set_param command "$PROGRAM"
+	procd_set_param env \
+		"debug=$(bool_word "$debug")" \
+		"interval_sec=$interval_sec" \
+		"downshift_intervals=$downshift_intervals" \
+		"sensor_fail_limit=$sensor_fail_limit" \
+		"enable_thermal_zones=$(bool_word "$enable_thermal_zones")" \
+		"off_rpm=$off_rpm" \
+		"low_rpm=$low_rpm" \
+		"mid_rpm=$mid_rpm" \
+		"max_rpm=$max_rpm" \
+		"cpu_low_up=$(mdeg "$cpu_low_up")" \
+		"cpu_mid_up=$(mdeg "$cpu_mid_up")" \
+		"cpu_max_up=$(mdeg "$cpu_max_up")" \
+		"cpu_low_down=$(mdeg "$cpu_low_down")" \
+		"cpu_mid_down=$(mdeg "$cpu_mid_down")" \
+		"cpu_max_down=$(mdeg "$cpu_max_down")" \
+		"aqr_low_up=$(mdeg "$aqr_low_up")" \
+		"aqr_mid_up=$(mdeg "$aqr_mid_up")" \
+		"aqr_max_up=$(mdeg "$aqr_max_up")" \
+		"aqr_low_down=$(mdeg "$aqr_low_down")" \
+		"aqr_mid_down=$(mdeg "$aqr_mid_down")" \
+		"aqr_max_down=$(mdeg "$aqr_max_down")" \
+		"wifi_low_up=$(mdeg "$wifi_low_up")" \
+		"wifi_mid_up=$(mdeg "$wifi_mid_up")" \
+		"wifi_max_up=$(mdeg "$wifi_max_up")" \
+		"wifi_low_down=$(mdeg "$wifi_low_down")" \
+		"wifi_mid_down=$(mdeg "$wifi_mid_down")" \
+		"wifi_max_down=$(mdeg "$wifi_max_down")"
+	procd_set_param file /etc/config/fan_monitor
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param respawn 3600 5 5
+	procd_close_instance
+}
+
+
+# Called by rc.common after procd has terminated the service instance.
+# The gpio-fan hwmon driver retains the last target after the userspace
+# controller exits, so explicitly select the configured Off target.
+fan_set_off() {
+	config_load "$CONFIG"
+
+	local off_rpm h name target
+	config_get off_rpm main off_rpm 0
+
+	for h in /sys/class/hwmon/hwmon*; do
+		[ -d "$h" ] || continue
+		name="$(cat "$h/name" 2>/dev/null)"
+		[ "$name" = "gpio_fan" ] || continue
+
+		target="$h/fan1_target"
+		[ -w "$target" ] || continue
+
+		if echo "$off_rpm" > "$target" 2>/dev/null; then
+			logger -t fan_monitor "service stopped: fan target set to ${off_rpm} RPM"
+			return 0
+		fi
+	done
+
+	logger -t fan_monitor "WARNING: service stopped but gpio_fan target could not be set to ${off_rpm} RPM"
+	return 1
+}
+
+service_stopped() {
+	rm -f "$RUNTIME_STATUS" 2>/dev/null
+	# Keep the stop command successful even if sysfs is temporarily unavailable.
+	# Kernel thermal protection may still start the fan when a CPU active trip is hit.
+	fan_set_off || true
+}
+
+service_triggers() {
+	procd_add_reload_trigger "$CONFIG"
+}

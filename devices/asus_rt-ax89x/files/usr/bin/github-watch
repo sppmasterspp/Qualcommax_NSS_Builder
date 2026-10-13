@@ -1,0 +1,467 @@
+#!/bin/sh
+
+# Telegram GitHub Watch for OpenWrt / BusyBox ash
+#
+# This distributable version contains no Telegram or GitHub tokens.
+# Monitoring remains disabled until the administrator:
+#   1. creates the Telegram token file manually;
+#   2. sets CHAT_ID in /etc/github-watch.conf;
+#   3. changes ENABLED='0' to ENABLED='1'.
+
+TAG="github-watch"
+CONFIG_FILE="${CONFIG_FILE:-/etc/github-watch.conf}"
+
+log() {
+    logger -t "$TAG" "$*"
+}
+
+die() {
+    log "Error: $*"
+    exit 1
+}
+
+not_started() {
+    log "Not started: $*"
+    exit 0
+}
+
+usage() {
+    cat <<'USAGE'
+Usage: github-watch [--check-config]
+
+  --check-config  Validate the configuration without contacting GitHub or Telegram.
+USAGE
+}
+
+case "${1:-}" in
+    "") ;;
+    --check-config) CHECK_ONLY=1 ;;
+    -h|--help)
+        usage
+        exit 0
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac
+
+CHECK_ONLY="${CHECK_ONLY:-0}"
+
+# Read owner and mode without requiring a standalone stat command. Some
+# compact OpenWrt builds omit the stat applet, so ls/awk is the final fallback.
+get_owner_uid() {
+    metadata_path=$1
+
+    if command -v stat >/dev/null 2>&1; then
+        stat -c '%u' "$metadata_path" 2>/dev/null && return 0
+    fi
+
+    if command -v busybox >/dev/null 2>&1 &&
+       busybox stat -c '%u' "$metadata_path" >/dev/null 2>&1; then
+        busybox stat -c '%u' "$metadata_path" 2>/dev/null && return 0
+    fi
+
+    LC_ALL=C ls -ldn "$metadata_path" 2>/dev/null |
+        awk 'NR == 1 { print $3; found=1 } END { exit !found }'
+}
+
+get_private_mode() {
+    metadata_path=$1
+
+    if command -v stat >/dev/null 2>&1; then
+        stat -c '%a' "$metadata_path" 2>/dev/null && return 0
+    fi
+
+    if command -v busybox >/dev/null 2>&1 &&
+       busybox stat -c '%a' "$metadata_path" >/dev/null 2>&1; then
+        busybox stat -c '%a' "$metadata_path" 2>/dev/null && return 0
+    fi
+
+    permission_text=$(LC_ALL=C ls -ld "$metadata_path" 2>/dev/null |
+        awk 'NR == 1 { print $1; found=1 } END { exit !found }') || return 1
+
+    case "$permission_text" in
+        -r--------) printf '%s\n' 400 ;;
+        -rw-------) printf '%s\n' 600 ;;
+        drwx------) printf '%s\n' 700 ;;
+        *) printf '%s\n' "$permission_text" ;;
+    esac
+}
+
+# Validate a root-owned private configuration file before sourcing it.
+validate_config_file() {
+    path=$1
+
+    [ -f "$path" ] || return 1
+    [ ! -L "$path" ] || die "Configuration file must not be a symbolic link: $path"
+
+    owner_uid=$(get_owner_uid "$path") ||
+        die "Cannot inspect configuration file ownership: $path"
+    mode=$(get_private_mode "$path") ||
+        die "Cannot inspect configuration file permissions: $path"
+
+    [ "$owner_uid" = "0" ] ||
+        die "Configuration file must be owned by root: $path"
+
+    case "$mode" in
+        400|600) ;;
+        *) die "Unsafe configuration permissions $mode for $path; expected 400 or 600" ;;
+    esac
+}
+
+[ -r "$CONFIG_FILE" ] ||
+    not_started "configuration file is missing or unreadable: $CONFIG_FILE"
+validate_config_file "$CONFIG_FILE" ||
+    not_started "configuration file is missing: $CONFIG_FILE"
+
+# The validated root-owned file is intentionally sourced because it contains
+# shell configuration assignments. It must never be writable by other users.
+# shellcheck source=/dev/null
+. "$CONFIG_FILE"
+
+ENABLED="${ENABLED:-0}"
+TOKEN_FILE="${TOKEN_FILE:-/etc/github-watch/telegram.token}"
+GITHUB_TOKEN_FILE="${GITHUB_TOKEN_FILE:-/etc/github-watch/github.token}"
+STATE_DIR="${STATE_DIR:-/mnt/sda1/github-watch/state}"
+GITHUB_API_VERSION="${GITHUB_API_VERSION:-2026-03-10}"
+NOTIFY_ON_FIRST_RUN="${NOTIFY_ON_FIRST_RUN:-0}"
+NOTIFY_ERRORS="${NOTIFY_ERRORS:-1}"
+
+[ "$ENABLED" = "1" ] ||
+    not_started "monitoring is disabled; set ENABLED='1' after configuring the token and chat ID"
+
+[ -n "${CHAT_ID:-}" ] ||
+    not_started "CHAT_ID is not configured in $CONFIG_FILE"
+printf '%s\n' "$CHAT_ID" | grep -Eq '^-?[0-9]+$' ||
+    die "CHAT_ID has an invalid format"
+
+[ -n "${REPOS:-}" ] || die "REPOS is empty"
+
+# Validate a secret file and the directory that contains it.
+# The directory must be root-owned mode 700; the file must be root-owned
+# mode 400 or 600 and must not be a symbolic link.
+validate_secret_file() {
+    path=$1
+    label=$2
+    directory=$(dirname "$path")
+
+    [ -d "$directory" ] || return 1
+    [ ! -L "$directory" ] || die "$label directory must not be a symbolic link: $directory"
+
+    dir_owner=$(get_owner_uid "$directory") ||
+        die "Cannot inspect $label directory ownership: $directory"
+    dir_mode=$(get_private_mode "$directory") ||
+        die "Cannot inspect $label directory permissions: $directory"
+
+    [ "$dir_owner" = "0" ] ||
+        die "$label directory must be owned by root: $directory"
+    [ "$dir_mode" = "700" ] ||
+        die "Unsafe $label directory permissions $dir_mode for $directory; expected 700"
+
+    [ -f "$path" ] || return 1
+    [ ! -L "$path" ] || die "$label file must not be a symbolic link: $path"
+
+    file_owner=$(get_owner_uid "$path") ||
+        die "Cannot inspect $label file ownership: $path"
+    file_mode=$(get_private_mode "$path") ||
+        die "Cannot inspect $label file permissions: $path"
+
+    [ "$file_owner" = "0" ] ||
+        die "$label file must be owned by root: $path"
+
+    case "$file_mode" in
+        400|600) ;;
+        *) die "Unsafe $label file permissions $file_mode for $path; expected 400 or 600" ;;
+    esac
+}
+
+validate_secret_file "$TOKEN_FILE" "Telegram token" ||
+    not_started "Telegram token is not configured; create $TOKEN_FILE manually"
+
+# Read exactly one non-empty token line as data, never as shell code.
+BOT_TOKEN=$(sed -n '1{s/\r$//;p;}' "$TOKEN_FILE")
+extra_token_data=$(sed -n '2,$p' "$TOKEN_FILE" | grep -v '^[[:space:]]*$' | head -n 1)
+
+[ -n "$BOT_TOKEN" ] ||
+    not_started "Telegram token file is empty: $TOKEN_FILE"
+[ -z "$extra_token_data" ] ||
+    die "Telegram token file must contain only one non-empty line: $TOKEN_FILE"
+printf '%s\n' "$BOT_TOKEN" | grep -Eq '^[0-9]+:[A-Za-z0-9_-]{20,}$' ||
+    die "Telegram token has an invalid format"
+
+# The optional GitHub token is also read from a separate private file.
+# Absence of this file means anonymous GitHub API access.
+GITHUB_TOKEN=""
+if [ -e "$GITHUB_TOKEN_FILE" ]; then
+    validate_secret_file "$GITHUB_TOKEN_FILE" "GitHub token" ||
+        die "Cannot use GitHub token file: $GITHUB_TOKEN_FILE"
+
+    GITHUB_TOKEN=$(sed -n '1{s/\r$//;p;}' "$GITHUB_TOKEN_FILE")
+    extra_github_data=$(sed -n '2,$p' "$GITHUB_TOKEN_FILE" | grep -v '^[[:space:]]*$' | head -n 1)
+
+    [ -n "$GITHUB_TOKEN" ] || die "GitHub token file is empty: $GITHUB_TOKEN_FILE"
+    [ -z "$extra_github_data" ] ||
+        die "GitHub token file must contain only one non-empty line: $GITHUB_TOKEN_FILE"
+    printf '%s\n' "$GITHUB_TOKEN" | grep -Eq '^[A-Za-z0-9_]+$' ||
+        die "GitHub token has an invalid format"
+fi
+
+for cmd in curl jq sed grep awk ls; do
+    command -v "$cmd" >/dev/null 2>&1 || die "$cmd is required but is not installed"
+done
+
+if [ "$CHECK_ONLY" = "1" ]; then
+    printf '%s\n' "GitHub Watch configuration is valid."
+    printf '%s\n' "Telegram token: configured securely"
+    printf '%s\n' "Telegram chat ID: configured"
+    if [ -n "$GITHUB_TOKEN" ]; then
+        printf '%s\n' "GitHub token: configured securely"
+    else
+        printf '%s\n' "GitHub token: not configured; anonymous API access will be used"
+    fi
+    printf '%s\n' "Monitoring: enabled"
+    exit 0
+fi
+
+umask 077
+mkdir -p "$STATE_DIR" || die "Cannot create state directory: $STATE_DIR"
+
+TMP_DIR=$(mktemp -d /tmp/github-watch.XXXXXX) || die "Cannot create temporary directory"
+trap 'rm -rf "$TMP_DIR"' 0
+trap 'exit 1' HUP INT TERM
+
+# Keep the Telegram API URL, which contains the bot token, out of curl's
+# command-line arguments. The temporary curl configuration is mode 600 and
+# removed automatically when the script exits.
+TELEGRAM_CURL_CONFIG="$TMP_DIR/telegram-curl.conf"
+printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$BOT_TOKEN" \
+    >"$TELEGRAM_CURL_CONFIG" || die "Cannot create temporary Telegram curl configuration"
+chmod 600 "$TELEGRAM_CURL_CONFIG" || die "Cannot protect temporary Telegram curl configuration"
+unset BOT_TOKEN
+
+html_escape() {
+    sed \
+        -e 's/&/\&amp;/g' \
+        -e 's/</\&lt;/g' \
+        -e 's/>/\&gt;/g'
+}
+
+atomic_write() (
+    value=$1
+    destination=$2
+    temporary="${destination}.tmp.$$"
+
+    printf '%s\n' "$value" >"$temporary" && mv -f "$temporary" "$destination"
+)
+
+send_message() (
+    text=$1
+    response_file="$TMP_DIR/telegram-response.$$"
+
+    http_code=$(curl --config "$TELEGRAM_CURL_CONFIG" \
+        -sS \
+        --connect-timeout 10 \
+        --max-time 30 \
+        --retry 2 \
+        --retry-delay 2 \
+        -o "$response_file" \
+        -w '%{http_code}' \
+        -X POST \
+        --data-urlencode "chat_id=${CHAT_ID}" \
+        --data-urlencode 'parse_mode=HTML' \
+        --data-urlencode 'disable_web_page_preview=true' \
+        --data-urlencode "text=${text}")
+    curl_status=$?
+
+    if [ "$curl_status" -ne 0 ]; then
+        log "Telegram request failed with curl status $curl_status"
+        return 1
+    fi
+
+    if [ "$http_code" != "200" ] || ! jq -e '.ok == true' "$response_file" >/dev/null 2>&1; then
+        description=$(jq -r '.description // "unknown Telegram error"' "$response_file" 2>/dev/null)
+        log "Telegram API error: HTTP $http_code: $description"
+        return 1
+    fi
+
+    return 0
+)
+
+github_get() (
+    url=$1
+    body_file=$2
+    header_file=$3
+    etag=$4
+
+    set -- \
+        -sS \
+        --connect-timeout 10 \
+        --max-time 45 \
+        --retry 2 \
+        --retry-delay 2 \
+        -D "$header_file" \
+        -o "$body_file" \
+        -w '%{http_code}' \
+        -H 'Accept: application/vnd.github+json' \
+        -H "X-GitHub-Api-Version: ${GITHUB_API_VERSION}" \
+        -H 'User-Agent: openwrt-telegram-github-watch'
+
+    if [ -n "$GITHUB_TOKEN" ]; then
+        set -- "$@" -H "Authorization: Bearer ${GITHUB_TOKEN}"
+    fi
+
+    if [ -n "$etag" ]; then
+        set -- "$@" -H "If-None-Match: ${etag}"
+    fi
+
+    curl "$@" "$url"
+)
+
+report_error_once() (
+    signature=$1
+    message=$2
+    error_file=$3
+
+    log "$message"
+    [ "$NOTIFY_ERRORS" = "1" ] || return 0
+
+    previous=""
+    [ -r "$error_file" ] && previous=$(cat "$error_file")
+    [ "$signature" = "$previous" ] && return 0
+
+    escaped_message=$(printf '%s' "$message" | html_escape)
+    if send_message "⚠️ <b>GitHub Watch warning</b>\n\n${escaped_message}"; then
+        atomic_write "$signature" "$error_file"
+    fi
+)
+
+# Format: owner/repository branch
+printf '%s\n' "$REPOS" | while read -r REPO BRANCH EXTRA; do
+    [ -z "$REPO" ] && continue
+    case "$REPO" in
+        \#*) continue ;;
+    esac
+
+    if [ -z "$BRANCH" ] || [ -n "$EXTRA" ]; then
+        log "Skipping invalid repository entry: $REPO $BRANCH $EXTRA"
+        continue
+    fi
+
+    if ! printf '%s\n' "$REPO" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; then
+        log "Skipping invalid repository name: $REPO"
+        continue
+    fi
+
+    branch_encoded=$(jq -rn --arg value "$BRANCH" '$value | @uri')
+    state_key=$(printf '%s__%s' "$REPO" "$BRANCH" | jq -sRr '@uri')
+
+    state_file="$STATE_DIR/${state_key}.sha"
+    etag_file="$STATE_DIR/${state_key}.etag"
+    error_file="$STATE_DIR/${state_key}.error"
+    body_file="$TMP_DIR/github-body.$$"
+    header_file="$TMP_DIR/github-headers.$$"
+
+    old_etag=""
+    if [ -r "$state_file" ] && [ -r "$etag_file" ]; then
+        old_etag=$(cat "$etag_file")
+    fi
+
+    url="https://api.github.com/repos/${REPO}/branches/${branch_encoded}"
+    log "Checking $REPO ($BRANCH)"
+
+    http_code=$(github_get "$url" "$body_file" "$header_file" "$old_etag")
+    curl_status=$?
+
+    if [ "$curl_status" -ne 0 ]; then
+        report_error_once \
+            "curl-${curl_status}" \
+            "Network error while checking $REPO ($BRANCH); curl status $curl_status" \
+            "$error_file"
+        continue
+    fi
+
+    if [ "$http_code" = "304" ]; then
+        rm -f "$error_file"
+        continue
+    fi
+
+    if [ "$http_code" != "200" ]; then
+        api_message=$(jq -r '.message // "unknown GitHub API error"' "$body_file" 2>/dev/null)
+        report_error_once \
+            "http-${http_code}-${api_message}" \
+            "GitHub API error for $REPO ($BRANCH): HTTP $http_code: $api_message" \
+            "$error_file"
+        continue
+    fi
+
+    latest=$(jq -er '.commit.sha | select(type == "string" and length > 0)' "$body_file" 2>/dev/null)
+    if [ -z "$latest" ]; then
+        report_error_once \
+            'invalid-json' \
+            "Invalid GitHub response for $REPO ($BRANCH)" \
+            "$error_file"
+        continue
+    fi
+
+    new_etag=$(sed -n 's/^[Ee][Tt][Aa][Gg]:[[:space:]]*//p' "$header_file" | tr -d '\r' | tail -n 1)
+    last=""
+    [ -r "$state_file" ] && last=$(cat "$state_file")
+
+    # On the first successful run, initialize state silently unless explicitly enabled.
+    if [ -z "$last" ] && [ "$NOTIFY_ON_FIRST_RUN" != "1" ]; then
+        atomic_write "$latest" "$state_file" || {
+            log "Cannot save initial state for $REPO ($BRANCH)"
+            continue
+        }
+        [ -n "$new_etag" ] && atomic_write "$new_etag" "$etag_file"
+        rm -f "$error_file"
+        log "Initialized state for $REPO ($BRANCH) at ${latest}"
+        continue
+    fi
+
+    if [ "$latest" = "$last" ]; then
+        [ -n "$new_etag" ] && atomic_write "$new_etag" "$etag_file"
+        rm -f "$error_file"
+        continue
+    fi
+
+    full_message=$(jq -r '.commit.commit.message // "No commit message"' "$body_file" 2>/dev/null | sed -n '1p')
+    message=$(printf '%s' "$full_message" | cut -c 1-180)
+    [ "${#full_message}" -gt 180 ] && message="${message}..."
+
+    author=$(jq -r '.commit.commit.author.name // .commit.author.login // "Unknown"' "$body_file" 2>/dev/null)
+    commit_date=$(jq -r '.commit.commit.author.date // "Unknown"' "$body_file" 2>/dev/null)
+    short_sha=$(printf '%s' "$latest" | cut -c 1-7)
+
+    repo_html=$(printf '%s' "$REPO" | html_escape)
+    branch_html=$(printf '%s' "$BRANCH" | html_escape)
+    author_html=$(printf '%s' "$author" | html_escape)
+    message_html=$(printf '%s' "$message" | html_escape)
+    date_html=$(printf '%s' "$commit_date" | html_escape)
+    commit_url="https://github.com/${REPO}/commit/${latest}"
+
+    text="🔔 <b>New commit detected</b>
+
+📁 <b>Repository:</b> ${repo_html}
+🌿 <b>Branch:</b> ${branch_html}
+👤 <b>Author:</b> ${author_html}
+🕒 <b>Date:</b> ${date_html}
+🔗 <b>Commit:</b> <a href=\"${commit_url}\"><code>${short_sha}</code></a>
+💬 <b>Message:</b> ${message_html}"
+
+    # Save the new SHA only after Telegram confirms successful delivery.
+    if send_message "$text"; then
+        if atomic_write "$latest" "$state_file"; then
+            [ -n "$new_etag" ] && atomic_write "$new_etag" "$etag_file"
+            rm -f "$error_file"
+            log "Notification sent for $REPO ($BRANCH): $short_sha"
+        else
+            log "Notification was sent, but state could not be saved for $REPO ($BRANCH)"
+        fi
+    else
+        log "Notification failed for $REPO ($BRANCH); state was not advanced"
+    fi
+done
+
+log "GitHub watch completed"

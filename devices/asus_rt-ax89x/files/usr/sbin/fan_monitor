@@ -1,0 +1,723 @@
+#!/bin/sh
+
+# Asus RT-AX89X fan monitor for OpenWrt / BusyBox ash
+#
+# Monitored sensors:
+#   - maximum of cpu0..cpu3 and cluster thermal sensors
+#   - the detected Aquantia/Marvell AQR-family 10G copper PHY
+#   - ath11k phy0 and phy1
+#
+# Fan states reported by the gpio-fan driver:
+#   0 -> 0 RPM
+#   1 -> 1600 RPM
+#   2 -> 1850 RPM
+#   3 -> 2100 RPM
+#
+# The kernel thermal zones remain enabled. The script only adds earlier
+# cooling decisions for CPU, Wi-Fi and the detected AQR-family PHY.
+
+PATH='/usr/sbin:/usr/bin:/sbin:/bin'
+
+COMMON_LIB='/usr/lib/fan_monitor/common.sh'
+[ -r "$COMMON_LIB" ] || { echo "fan_monitor: ERROR: missing $COMMON_LIB" >&2; exit 1; }
+. "$COMMON_LIB"
+
+# Runtime options; each can be overridden through the environment.
+debug=${debug:-false}
+interval_sec=${interval_sec:-15}
+downshift_intervals=${downshift_intervals:-4}
+sensor_fail_limit=${sensor_fail_limit:-3}
+enable_thermal_zones=${enable_thermal_zones:-true}
+
+# GPIO fan target values; configurable through the environment/UCI service.
+off_rpm=${off_rpm:-0}
+low_rpm=${low_rpm:-1600}
+mid_rpm=${mid_rpm:-1850}
+max_rpm=${max_rpm:-2100}
+
+# Thresholds are in millidegrees Celsius.
+# CPU: max(cpu0, cpu1, cpu2, cpu3, cluster)
+cpu_low_up=${cpu_low_up:-62000}
+cpu_mid_up=${cpu_mid_up:-66000}
+cpu_max_up=${cpu_max_up:-70000}
+cpu_low_down=${cpu_low_down:-59000}
+cpu_mid_down=${cpu_mid_down:-63000}
+cpu_max_down=${cpu_max_down:-67000}
+
+# Aquantia/Marvell AQR-family 10G copper PHY.
+aqr_low_up=${aqr_low_up:-65000}
+aqr_mid_up=${aqr_mid_up:-74000}
+aqr_max_up=${aqr_max_up:-80000}
+aqr_low_down=${aqr_low_down:-62000}
+aqr_mid_down=${aqr_mid_down:-72000}
+aqr_max_down=${aqr_max_down:-78000}
+
+# ath11k radio temperatures, evaluated independently.
+wifi_low_up=${wifi_low_up:-68000}
+wifi_mid_up=${wifi_mid_up:-73000}
+wifi_max_up=${wifi_max_up:-78000}
+wifi_low_down=${wifi_low_down:-65000}
+wifi_mid_down=${wifi_mid_down:-70000}
+wifi_max_down=${wifi_max_down:-75000}
+
+lock_dir='/var/run/fan_monitor.lock'
+runtime_status_file='/var/run/fan_monitor.status'
+
+fan_hwmon=''
+fan_target_file=''
+fan_input_file=''
+fan_pwm_file=''
+cpu_hwmon_paths=''
+aqr_hwmon=''
+aqr_temp_file=''
+wifi0_hwmon=''
+wifi1_hwmon=''
+aqr_model=''
+aqr_driver=''
+aqr_phy_id=''
+aqr_mdio_address=''
+aqr_of_path=''
+aqr_netdev=''
+aqr_detection_method=''
+aqr_identity_warning=''
+router_model='Asus RT-AX89X'
+router_hw_revision='Unknown'
+router_pcb_revision='Unknown'
+router_revision_confidence='none'
+router_revision_basis=''
+
+cpu_last=''
+aqr_last=''
+wifi0_last=''
+wifi1_last=''
+
+cpu_fail_count=0
+aqr_fail_count=0
+wifi0_fail_count=0
+wifi1_fail_count=0
+
+cpu_state=0
+aqr_state=0
+wifi0_state=0
+wifi1_state=0
+
+pending_down_state=''
+pending_down_count=0
+
+log_msg() {
+  if command -v logger >/dev/null 2>&1; then
+    logger -t fan_monitor "$*"
+  else
+    echo "fan_monitor: $*" >&2
+  fi
+}
+
+debug_msg() {
+  [ "$debug" = true ] && echo "fan_monitor: $*" >&2
+}
+
+fatal() {
+  log_msg "ERROR: $*"
+  echo "fan_monitor: ERROR: $*" >&2
+  exit 1
+}
+
+is_uint() { fm_is_uint "$1"; }
+
+validate_config() {
+  case "$debug" in true|false) ;; *) fatal "debug must be true or false" ;; esac
+  case "$enable_thermal_zones" in true|false) ;; *) fatal "enable_thermal_zones must be true or false" ;; esac
+
+  is_uint "$interval_sec" || fatal "interval_sec must be a positive integer"
+  is_uint "$downshift_intervals" || fatal "downshift_intervals must be a positive integer"
+  is_uint "$sensor_fail_limit" || fatal "sensor_fail_limit must be a positive integer"
+
+  [ "$interval_sec" -gt 0 ] || fatal "interval_sec must be greater than zero"
+  [ "$downshift_intervals" -gt 0 ] || fatal "downshift_intervals must be greater than zero"
+  [ "$sensor_fail_limit" -gt 0 ] || fatal "sensor_fail_limit must be greater than zero"
+
+  for value in \
+    "$off_rpm" "$low_rpm" "$mid_rpm" "$max_rpm" \
+    "$cpu_low_up" "$cpu_mid_up" "$cpu_max_up" \
+    "$cpu_low_down" "$cpu_mid_down" "$cpu_max_down" \
+    "$aqr_low_up" "$aqr_mid_up" "$aqr_max_up" \
+    "$aqr_low_down" "$aqr_mid_down" "$aqr_max_down" \
+    "$wifi_low_up" "$wifi_mid_up" "$wifi_max_up" \
+    "$wifi_low_down" "$wifi_mid_down" "$wifi_max_down"
+  do
+    is_uint "$value" || fatal "RPM values and temperature thresholds must be unsigned integers"
+  done
+
+  [ "$off_rpm" -lt "$low_rpm" ] && \
+  [ "$low_rpm" -lt "$mid_rpm" ] && \
+  [ "$mid_rpm" -lt "$max_rpm" ] || \
+    fatal "fan RPM values must satisfy off < low < mid < max"
+
+  validate_thresholds() {
+    sensor="$1"; low_up="$2"; mid_up="$3"; max_up="$4"
+    low_down="$5"; mid_down="$6"; max_down="$7"
+
+    [ "$low_up" -lt "$mid_up" ] && [ "$mid_up" -lt "$max_up" ] || \
+      fatal "$sensor upward thresholds must satisfy low < mid < max"
+    [ "$low_down" -lt "$mid_down" ] && [ "$mid_down" -lt "$max_down" ] || \
+      fatal "$sensor downward thresholds must satisfy low < mid < max"
+    [ "$low_down" -lt "$low_up" ] && \
+    [ "$mid_down" -lt "$mid_up" ] && \
+    [ "$max_down" -lt "$max_up" ] || \
+      fatal "$sensor downward thresholds must be lower than matching upward thresholds"
+    [ "$max_up" -le 125000 ] || fatal "$sensor threshold exceeds 125 C"
+  }
+
+  validate_thresholds CPU \
+    "$cpu_low_up" "$cpu_mid_up" "$cpu_max_up" \
+    "$cpu_low_down" "$cpu_mid_down" "$cpu_max_down"
+  validate_thresholds AQR \
+    "$aqr_low_up" "$aqr_mid_up" "$aqr_max_up" \
+    "$aqr_low_down" "$aqr_mid_down" "$aqr_max_down"
+  validate_thresholds WiFi \
+    "$wifi_low_up" "$wifi_mid_up" "$wifi_max_up" \
+    "$wifi_low_down" "$wifi_mid_down" "$wifi_max_down"
+}
+
+acquire_lock() {
+  if mkdir "$lock_dir" 2>/dev/null; then
+    echo "$$" > "$lock_dir/pid"
+    return 0
+  fi
+
+  old_pid=''
+  [ -r "$lock_dir/pid" ] && old_pid=$(cat "$lock_dir/pid" 2>/dev/null)
+
+  if is_uint "$old_pid" && kill -0 "$old_pid" 2>/dev/null; then
+    fatal "another instance is already running with PID $old_pid"
+  fi
+
+  rm -rf "$lock_dir" 2>/dev/null
+  mkdir "$lock_dir" 2>/dev/null || fatal "cannot create lock directory $lock_dir"
+  echo "$$" > "$lock_dir/pid"
+}
+
+cleanup() {
+  rm -rf "$lock_dir" 2>/dev/null
+  rm -f "$runtime_status_file" 2>/dev/null
+}
+
+enable_kernel_thermal_protection() {
+  [ "$enable_thermal_zones" = true ] || return 0
+
+  changed=0
+  for zone in "$THERMAL_CLASS_ROOT"/thermal_zone*; do
+    [ -d "$zone" ] || continue
+    type=$(cat "$zone/type" 2>/dev/null)
+    case "$type" in
+      cpu[0-9]*-thermal|cluster-thermal|cpu-thermal) ;;
+      *) continue ;;
+    esac
+
+    mode="$zone/mode"
+    [ -w "$mode" ] || continue
+    current=$(cat "$mode" 2>/dev/null)
+    if [ "$current" != enabled ]; then
+      if echo enabled > "$mode" 2>/dev/null; then
+        changed=$((changed + 1))
+      else
+        log_msg "WARNING: could not enable $mode"
+      fi
+    fi
+  done
+
+  [ "$changed" -gt 0 ] && log_msg "enabled $changed CPU kernel thermal zone(s)"
+}
+
+discover_hwmon() {
+  fan_hwmon=''
+  fan_target_file=''
+  fan_input_file=''
+  fan_pwm_file=''
+  cpu_hwmon_paths=''
+  aqr_hwmon=''
+  aqr_temp_file=''
+  wifi0_hwmon=''
+  wifi1_hwmon=''
+  aqr_model=''
+  aqr_driver=''
+  aqr_phy_id=''
+  aqr_mdio_address=''
+  aqr_of_path=''
+  aqr_netdev=''
+  aqr_detection_method=''
+  aqr_identity_warning=''
+
+  if fm_detect_fan_hwmon; then
+    fan_hwmon="$FAN_HWMON"
+    fan_target_file="$fan_hwmon/fan1_target"
+    fan_input_file="$fan_hwmon/fan1_input"
+    fan_pwm_file="$fan_hwmon/pwm1"
+  fi
+
+  if fm_detect_cpu_hwmon_paths; then
+    cpu_hwmon_paths="$CPU_HWMON_PATHS"
+  fi
+
+  fm_detect_wifi_hwmon || true
+  wifi0_hwmon="$WIFI0_HWMON"
+  wifi1_hwmon="$WIFI1_HWMON"
+
+  if fm_detect_aqr_hwmon; then
+    aqr_hwmon="$AQR_HWMON"
+    aqr_temp_file="$AQR_TEMP_INPUT"
+    aqr_model="$AQR_MODEL"
+    aqr_driver="$AQR_DRIVER"
+    aqr_phy_id="$AQR_PHY_ID"
+    aqr_mdio_address="$AQR_MDIO_ADDRESS"
+    aqr_of_path="$AQR_OF_PATH"
+    aqr_netdev="$AQR_ATTACHED_NETDEV"
+    aqr_detection_method="$AQR_DETECTION_METHOD"
+    aqr_identity_warning="$AQR_IDENTITY_WARNING"
+    fm_infer_router_revision || true
+    router_hw_revision="$ROUTER_HW_REVISION"
+    router_pcb_revision="$ROUTER_PCB_REVISION"
+    router_revision_confidence="$ROUTER_REVISION_CONFIDENCE"
+    router_revision_basis="$ROUTER_REVISION_BASIS"
+  else
+    router_hw_revision='Unknown'
+    router_pcb_revision='Unknown'
+    router_revision_confidence='none'
+    router_revision_basis='AQR-family PHY was not detected'
+  fi
+
+  fm_detect_router_model
+  router_model="$ROUTER_MODEL"
+}
+
+validate_discovery() {
+  [ -n "$fan_hwmon" ] || fatal "cannot find gpio_fan hwmon device"
+  [ -w "$fan_target_file" ] || fatal "fan target is not writable: $fan_target_file"
+  [ -n "$cpu_hwmon_paths" ] || fatal "cannot find CPU thermal hwmon sensors"
+
+  if [ -z "$aqr_hwmon" ]; then
+    log_msg "WARNING: Aquantia/Marvell AQR-family temperature sensor was not found; fail-safe will engage after $sensor_fail_limit samples"
+  fi
+  if [ -z "$wifi0_hwmon" ]; then
+    log_msg "WARNING: ath11k phy0 temperature sensor was not found; fail-safe will engage after $sensor_fail_limit samples"
+  fi
+  if [ -z "$wifi1_hwmon" ]; then
+    log_msg "WARNING: ath11k phy1 temperature sensor was not found; fail-safe will engage after $sensor_fail_limit samples"
+  fi
+}
+
+# Sets READ_VALUE and returns success only for plausible millidegree values.
+read_temp_file() {
+  file="$1"
+  READ_VALUE=''
+
+  [ -r "$file" ] || return 1
+  value=$(cat "$file" 2>/dev/null) || return 1
+
+  case "$value" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+
+  [ "$value" -ge 0 ] 2>/dev/null || return 1
+  [ "$value" -le 125000 ] 2>/dev/null || return 1
+
+  READ_VALUE="$value"
+  return 0
+}
+
+# Reads one sensor. A single transient failure reuses the last valid sample.
+# After sensor_fail_limit consecutive failures SAMPLE_FAILSAFE becomes true.
+sample_single_sensor() {
+  sensor_name="$1"
+  hwmon_path="$2"
+  previous_last="$3"
+  previous_fail="$4"
+
+  SAMPLE_TEMP=''
+  SAMPLE_LAST="$previous_last"
+  SAMPLE_FAIL="$previous_fail"
+  SAMPLE_FAILSAFE=false
+
+  if [ -n "$hwmon_path" ] && read_temp_file "$hwmon_path"; then
+    SAMPLE_TEMP="$READ_VALUE"
+    SAMPLE_LAST="$READ_VALUE"
+
+    if [ "$previous_fail" -ge "$sensor_fail_limit" ]; then
+      log_msg "$sensor_name sensor recovered after $previous_fail failed sample(s)"
+    elif [ "$previous_fail" -gt 0 ]; then
+      debug_msg "$sensor_name sensor recovered after one transient read failure"
+    fi
+
+    SAMPLE_FAIL=0
+    return 0
+  fi
+
+  SAMPLE_FAIL=$((previous_fail + 1))
+
+  if [ -n "$previous_last" ] && [ "$SAMPLE_FAIL" -lt "$sensor_fail_limit" ]; then
+    SAMPLE_TEMP="$previous_last"
+    debug_msg "invalid $sensor_name sample; reusing the last valid temperature"
+  else
+    [ "$previous_fail" -eq 0 ] && log_msg "WARNING: invalid or unavailable $sensor_name temperature"
+    SAMPLE_FAILSAFE=true
+    [ "$SAMPLE_FAIL" -eq "$sensor_fail_limit" ] && \
+      log_msg "ERROR: $sensor_name sensor failed $SAMPLE_FAIL consecutive samples; forcing maximum fan speed"
+  fi
+
+  return 1
+}
+
+sample_cpu() {
+  max_temp=''
+  valid_count=0
+
+  for h in $cpu_hwmon_paths; do
+    if read_temp_file "$h/temp1_input"; then
+      valid_count=$((valid_count + 1))
+      if [ -z "$max_temp" ] || [ "$READ_VALUE" -gt "$max_temp" ]; then
+        max_temp="$READ_VALUE"
+      fi
+    fi
+  done
+
+  CPU_TEMP=''
+  CPU_FAILSAFE=false
+
+  if [ "$valid_count" -gt 0 ]; then
+    CPU_TEMP="$max_temp"
+    cpu_last="$max_temp"
+
+    if [ "$cpu_fail_count" -gt 0 ]; then
+      log_msg "CPU thermal sensors recovered after $cpu_fail_count failed sample(s)"
+    fi
+
+    cpu_fail_count=0
+    return 0
+  fi
+
+  previous_fail="$cpu_fail_count"
+  cpu_fail_count=$((cpu_fail_count + 1))
+
+  if [ "$previous_fail" -eq 0 ]; then
+    log_msg "WARNING: no valid CPU thermal sensor value"
+  fi
+
+  if [ -n "$cpu_last" ] && [ "$cpu_fail_count" -lt "$sensor_fail_limit" ]; then
+    CPU_TEMP="$cpu_last"
+  else
+    CPU_FAILSAFE=true
+    [ "$cpu_fail_count" -eq "$sensor_fail_limit" ] && \
+      log_msg "ERROR: CPU thermal sensors failed $cpu_fail_count consecutive samples; forcing maximum fan speed"
+  fi
+
+  return 1
+}
+
+# Hysteretic state calculation.
+# Arguments: current temp low_up mid_up max_up low_down mid_down max_down
+# Result is placed in NEXT_STATE.
+compute_sensor_state() {
+  current="$1"
+  temp="$2"
+  low_up="$3"
+  mid_up="$4"
+  max_up="$5"
+  low_down="$6"
+  mid_down="$7"
+  max_down="$8"
+
+  case "$current" in
+    0)
+      if [ "$temp" -ge "$max_up" ]; then NEXT_STATE=3
+      elif [ "$temp" -ge "$mid_up" ]; then NEXT_STATE=2
+      elif [ "$temp" -ge "$low_up" ]; then NEXT_STATE=1
+      else NEXT_STATE=0
+      fi
+      ;;
+    1)
+      if [ "$temp" -ge "$max_up" ]; then NEXT_STATE=3
+      elif [ "$temp" -ge "$mid_up" ]; then NEXT_STATE=2
+      elif [ "$temp" -ge "$low_down" ]; then NEXT_STATE=1
+      else NEXT_STATE=0
+      fi
+      ;;
+    2)
+      if [ "$temp" -ge "$max_up" ]; then NEXT_STATE=3
+      elif [ "$temp" -ge "$mid_down" ]; then NEXT_STATE=2
+      elif [ "$temp" -ge "$low_down" ]; then NEXT_STATE=1
+      else NEXT_STATE=0
+      fi
+      ;;
+    3)
+      if [ "$temp" -ge "$max_down" ]; then NEXT_STATE=3
+      elif [ "$temp" -ge "$mid_down" ]; then NEXT_STATE=2
+      elif [ "$temp" -ge "$low_down" ]; then NEXT_STATE=1
+      else NEXT_STATE=0
+      fi
+      ;;
+    *) NEXT_STATE=3 ;;
+  esac
+}
+
+state_to_rpm() {
+  case "$1" in
+    0) STATE_RPM=$off_rpm ;;
+    1) STATE_RPM=$low_rpm ;;
+    2) STATE_RPM=$mid_rpm ;;
+    3) STATE_RPM=$max_rpm ;;
+    *) STATE_RPM=$max_rpm ;;
+  esac
+}
+
+rpm_to_state() {
+  rpm="$1"
+
+  case "$rpm" in
+    "$off_rpm") RPM_STATE=0 ;;
+    "$low_rpm") RPM_STATE=1 ;;
+    "$mid_rpm") RPM_STATE=2 ;;
+    "$max_rpm") RPM_STATE=3 ;;
+    *)
+      if ! is_uint "$rpm"; then
+        RPM_STATE=3
+      elif [ "$rpm" -le 800 ]; then
+        RPM_STATE=0
+      elif [ "$rpm" -le 1725 ]; then
+        RPM_STATE=1
+      elif [ "$rpm" -le 1975 ]; then
+        RPM_STATE=2
+      else
+        RPM_STATE=3
+      fi
+      ;;
+  esac
+}
+
+read_fan_state() {
+  current_rpm=$(cat "$fan_target_file" 2>/dev/null)
+  rpm_to_state "$current_rpm"
+  CURRENT_FAN_STATE="$RPM_STATE"
+}
+
+set_fan_state() {
+  new_state="$1"
+  state_to_rpm "$new_state"
+  new_rpm="$STATE_RPM"
+
+  if ! echo "$new_rpm" > "$fan_target_file" 2>/dev/null; then
+    log_msg "ERROR: failed to set fan target to $new_rpm RPM"
+    echo "$max_rpm" > "$fan_target_file" 2>/dev/null
+    return 1
+  fi
+
+  actual_target=$(cat "$fan_target_file" 2>/dev/null)
+  actual_input='NA'
+  actual_pwm='NA'
+  [ -r "$fan_input_file" ] && actual_input=$(cat "$fan_input_file" 2>/dev/null)
+  [ -r "$fan_pwm_file" ] && actual_pwm=$(cat "$fan_pwm_file" 2>/dev/null)
+
+  log_msg "fan state $new_state: target=${actual_target:-unknown} input=${actual_input:-unknown} pwm=${actual_pwm:-unknown}"
+  return 0
+}
+
+format_temp() {
+  value="$1"
+  if is_uint "$value"; then
+    TEMP_TEXT="$((value / 1000)).$(printf '%03d' $((value % 1000)))C"
+  else
+    TEMP_TEXT='NA'
+  fi
+}
+
+max_state() {
+  MAX_STATE=0
+  for state in "$@"; do
+    [ "$state" -gt "$MAX_STATE" ] && MAX_STATE="$state"
+  done
+}
+
+update_fan_with_delay() {
+  desired_state="$1"
+  read_fan_state
+  current_state="$CURRENT_FAN_STATE"
+
+  if [ "$desired_state" -gt "$current_state" ]; then
+    pending_down_state=''
+    pending_down_count=0
+    set_fan_state "$desired_state"
+    return
+  fi
+
+  if [ "$desired_state" -eq "$current_state" ]; then
+    pending_down_state=''
+    pending_down_count=0
+    return
+  fi
+
+  if [ "$pending_down_state" = "$desired_state" ]; then
+    pending_down_count=$((pending_down_count + 1))
+  else
+    pending_down_state="$desired_state"
+    pending_down_count=1
+  fi
+
+  if [ "$pending_down_count" -ge "$downshift_intervals" ]; then
+    set_fan_state "$desired_state"
+    pending_down_state=''
+    pending_down_count=0
+  fi
+}
+
+status_safe() {
+  # Runtime identity values are kernel-provided strings. Keep the line-based
+  # status format parseable even if a future driver adds unexpected text.
+  printf '%s' "$1" | tr '\n\r=' '   '
+}
+
+# Publish the monitor's exact hysteretic per-sensor decisions for LuCI.
+# The file is replaced atomically so rpcd never reads a partial update.
+write_runtime_status() {
+  tmp_file="${runtime_status_file}.$$"
+
+  read_fan_state
+
+  {
+    echo "cpu_temp=${CPU_TEMP:-}"
+    echo "aqr_temp=${AQR_TEMP:-}"
+    echo "wifi0_temp=${WIFI0_TEMP:-}"
+    echo "wifi1_temp=${WIFI1_TEMP:-}"
+    echo "aqr_model=$(status_safe "$aqr_model")"
+    echo "aqr_driver=$(status_safe "$aqr_driver")"
+    echo "aqr_phy_id=$(status_safe "$aqr_phy_id")"
+    echo "aqr_mdio_address=$(status_safe "$aqr_mdio_address")"
+    echo "aqr_of_path=$(status_safe "$aqr_of_path")"
+    echo "aqr_netdev=$(status_safe "$aqr_netdev")"
+    echo "aqr_detection_method=$(status_safe "$aqr_detection_method")"
+    echo "aqr_temp_input=$(status_safe "$aqr_temp_file")"
+    echo "aqr_identity_warning=$(status_safe "$aqr_identity_warning")"
+    echo "router_model=$(status_safe "$router_model")"
+    echo "router_hw_revision=$(status_safe "$router_hw_revision")"
+    echo "router_pcb_revision=$(status_safe "$router_pcb_revision")"
+    echo "router_revision_confidence=$(status_safe "$router_revision_confidence")"
+    echo "router_revision_basis=$(status_safe "$router_revision_basis")"
+    echo "cpu_state=$cpu_state"
+    echo "aqr_state=$aqr_state"
+    echo "wifi0_state=$wifi0_state"
+    echo "wifi1_state=$wifi1_state"
+    echo "desired_state=$desired_state"
+    echo "fan_state=$CURRENT_FAN_STATE"
+    echo "cpu_failsafe=$CPU_FAILSAFE"
+    echo "aqr_failsafe=$AQR_FAILSAFE"
+    echo "wifi0_failsafe=$WIFI0_FAILSAFE"
+    echo "wifi1_failsafe=$WIFI1_FAILSAFE"
+    echo "pending_down_state=${pending_down_state:-}"
+    echo "pending_down_count=$pending_down_count"
+  } > "$tmp_file" || {
+    rm -f "$tmp_file" 2>/dev/null
+    return 1
+  }
+
+  chmod 644 "$tmp_file" 2>/dev/null || true
+  mv -f "$tmp_file" "$runtime_status_file"
+}
+
+monitor_once() {
+  # Re-discover on every pass so Wi-Fi reloads and hwmon renumbering are safe.
+  discover_hwmon
+  [ -n "$fan_target_file" ] && [ -w "$fan_target_file" ] || fatal "gpio_fan hwmon device disappeared"
+
+  sample_cpu
+
+  sample_single_sensor "${aqr_model:-AQR PHY}" "$aqr_temp_file" "$aqr_last" "$aqr_fail_count"
+  AQR_TEMP="$SAMPLE_TEMP"
+  aqr_last="$SAMPLE_LAST"
+  aqr_fail_count="$SAMPLE_FAIL"
+  AQR_FAILSAFE="$SAMPLE_FAILSAFE"
+
+  sample_single_sensor 'Wi-Fi phy0' "${wifi0_hwmon:+$wifi0_hwmon/temp1_input}" "$wifi0_last" "$wifi0_fail_count"
+  WIFI0_TEMP="$SAMPLE_TEMP"
+  wifi0_last="$SAMPLE_LAST"
+  wifi0_fail_count="$SAMPLE_FAIL"
+  WIFI0_FAILSAFE="$SAMPLE_FAILSAFE"
+
+  sample_single_sensor 'Wi-Fi phy1' "${wifi1_hwmon:+$wifi1_hwmon/temp1_input}" "$wifi1_last" "$wifi1_fail_count"
+  WIFI1_TEMP="$SAMPLE_TEMP"
+  wifi1_last="$SAMPLE_LAST"
+  wifi1_fail_count="$SAMPLE_FAIL"
+  WIFI1_FAILSAFE="$SAMPLE_FAILSAFE"
+
+  if [ "$CPU_FAILSAFE" = true ]; then
+    cpu_state=3
+  else
+    compute_sensor_state "$cpu_state" "$CPU_TEMP" \
+      "$cpu_low_up" "$cpu_mid_up" "$cpu_max_up" \
+      "$cpu_low_down" "$cpu_mid_down" "$cpu_max_down"
+    cpu_state="$NEXT_STATE"
+  fi
+
+  if [ "$AQR_FAILSAFE" = true ]; then
+    aqr_state=3
+  else
+    compute_sensor_state "$aqr_state" "$AQR_TEMP" \
+      "$aqr_low_up" "$aqr_mid_up" "$aqr_max_up" \
+      "$aqr_low_down" "$aqr_mid_down" "$aqr_max_down"
+    aqr_state="$NEXT_STATE"
+  fi
+
+  if [ "$WIFI0_FAILSAFE" = true ]; then
+    wifi0_state=3
+  else
+    compute_sensor_state "$wifi0_state" "$WIFI0_TEMP" \
+      "$wifi_low_up" "$wifi_mid_up" "$wifi_max_up" \
+      "$wifi_low_down" "$wifi_mid_down" "$wifi_max_down"
+    wifi0_state="$NEXT_STATE"
+  fi
+
+  if [ "$WIFI1_FAILSAFE" = true ]; then
+    wifi1_state=3
+  else
+    compute_sensor_state "$wifi1_state" "$WIFI1_TEMP" \
+      "$wifi_low_up" "$wifi_mid_up" "$wifi_max_up" \
+      "$wifi_low_down" "$wifi_mid_down" "$wifi_max_down"
+    wifi1_state="$NEXT_STATE"
+  fi
+
+  max_state "$cpu_state" "$aqr_state" "$wifi0_state" "$wifi1_state"
+  desired_state="$MAX_STATE"
+
+  if [ "$debug" = true ]; then
+    format_temp "$CPU_TEMP"; cpu_text="$TEMP_TEXT"
+    format_temp "$AQR_TEMP"; aqr_text="$TEMP_TEXT"
+    format_temp "$WIFI0_TEMP"; wifi0_text="$TEMP_TEXT"
+    format_temp "$WIFI1_TEMP"; wifi1_text="$TEMP_TEXT"
+
+    debug_msg "CPU=$cpu_text(s$cpu_state) ${aqr_model:-AQR}=$aqr_text(s$aqr_state) phy0=$wifi0_text(s$wifi0_state) phy1=$wifi1_text(s$wifi1_state) desired=s$desired_state"
+  fi
+
+  update_fan_with_delay "$desired_state"
+  write_runtime_status || debug_msg "could not publish runtime status"
+}
+
+main() {
+  validate_config
+  acquire_lock
+  trap cleanup EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  enable_kernel_thermal_protection
+  discover_hwmon
+  validate_discovery
+
+  log_msg "started: interval=${interval_sec}s downshift=${downshift_intervals} samples sensor_fail_limit=$sensor_fail_limit; PHY=${aqr_model:-not-detected} id=${aqr_phy_id:-unknown} MDIO=${aqr_mdio_address:-unknown}; revision=$router_hw_revision"
+
+  while true; do
+    monitor_once
+    sleep "$interval_sec" &
+    sleep_pid=$!
+    wait "$sleep_pid"
+  done
+}
+
+main "$@"

@@ -1,0 +1,236 @@
+#
+# Build config shared by every device in this repo — the NSS offload stack and
+# everything else that does not depend on which board is being built.
+#
+# prepare-build.sh concatenates this with devices/<device>/config (that file
+# wins on any symbol set in both) and runs `make defconfig`.
+#
+
+## Target Platform
+CONFIG_TARGET_qualcommax=y
+CONFIG_TARGET_qualcommax_ipq807x=y
+CONFIG_TARGET_qualcommax_ipq807x_DEVICE_asus_rt-ax89x=y
+
+## The subtarget is set per group in devices/<group>/config.
+
+## Sysupgrade-only images: the audience is people who already run OpenWrt, so
+## no initramfs/factory install images. initramfs is default-y for this target,
+## and the Asus RT-AX89X's recovery .trx caps its kernel at 16 MiB where the NSS
+## initramfs kernel is ~21 MiB, so it cannot be built at all.
+# CONFIG_TARGET_ROOTFS_INITRAMFS is not set
+
+## Compiler and Toolchain Optimization
+CONFIG_BINUTILS_USE_VERSION_2_46=y
+CONFIG_CCACHE=y
+CONFIG_DEVEL=y
+CONFIG_GCC_USE_VERSION_15=y
+CONFIG_TARGET_OPTIMIZATION="-O2 -pipe -mcpu=cortex-a53"
+CONFIG_TARGET_OPTIONS=y
+CONFIG_TOOLCHAINOPTS=y
+CONFIG_USE_GC_SECTIONS=y
+CONFIG_USE_LTO=y
+CONFIG_USE_MOLD=y
+CONFIG_ZLIB_OPTIMIZE_SPEED=y
+
+## Kernel Build Options
+CONFIG_BUILD_PATENTED=y
+CONFIG_EXPERIMENTAL=y
+CONFIG_KERNEL_BUILD_DOMAIN="proton.me"
+CONFIG_KERNEL_BUILD_USER="sppmaster"
+# CONFIG_KERNEL_KEYS is not set
+
+# Hardening build options
+CONFIG_GCC_DEFAULT_PIE=y
+CONFIG_GCC_DEFAULT_SSP=y
+CONFIG_PKG_CHECK_FORMAT_SECURITY=y
+CONFIG_PKG_ASLR_PIE_ALL=y
+CONFIG_PKG_CC_STACKPROTECTOR_ALL=y
+CONFIG_KERNEL_CC_STACKPROTECTOR_STRONG=y
+CONFIG_PKG_FORTIFY_SOURCE_3=y
+CONFIG_PKG_RELRO_FULL=y
+CONFIG_USE_SECCOMP=y
+
+## SSL and Cryptography Configuration
+CONFIG_LUA_ECO_MBEDTLS=n
+CONFIG_LUA_ECO_OPENSSL=y
+CONFIG_OPENSSL_OPTIMIZE_SPEED=y
+CONFIG_PACKAGE_apk-mbedtls=n
+CONFIG_PACKAGE_apk-openssl=y
+CONFIG_PACKAGE_libopenssl=y
+CONFIG_PACKAGE_libopenssl-oqsprovider=y
+CONFIG_PACKAGE_libustream-mbedtls=n
+CONFIG_PACKAGE_libustream-openssl=y
+CONFIG_PACKAGE_luci-ssl-openssl=y
+CONFIG_PACKAGE_luci-app-bcp38=y
+
+## Additional Packages and Utilities
+CONFIG_PACKAGE_ip-full=y
+CONFIG_PACKAGE_curl=y
+CONFIG_PACKAGE_htop=y
+CONFIG_HTOP_LMSENSORS=n
+CONFIG_PACKAGE_iperf3=y
+CONFIG_LIBCURL_MBEDTLS=n
+CONFIG_LIBCURL_OPENSSL=y
+CONFIG_PACKAGE_luci=y
+CONFIG_PACKAGE_luci-app-firewall=y
+CONFIG_PACKAGE_wpad-openssl=y
+CONFIG_PACKAGE_hostapd-utils=y
+
+CONFIG_PACKAGE_gawk=y
+CONFIG_PACKAGE_grep=y
+CONFIG_PACKAGE_lm-sensors=y
+CONFIG_PACKAGE_iw-full=y
+CONFIG_PACKAGE_jq=y
+CONFIG_PACKAGE_qrencode=y
+CONFIG_PACKAGE_sed=y
+CONFIG_PACKAGE_speedtestcpp=y
+CONFIG_PACKAGE_tcpdump=y
+CONFIG_PACKAGE_wifi-chipset-detect=y
+CONFIG_PACKAGE_wget-ssl=y
+
+## USB storage. Stock images install it from the kmods feed, which cannot
+## serve this kernel, so it is built in. kmod-fs-ext4 is a target default.
+CONFIG_PACKAGE_kmod-usb-storage=y
+CONFIG_PACKAGE_kmod-usb-storage-uas=y
+CONFIG_PACKAGE_block-mount=y
+CONFIG_PACKAGE_blkid=y
+
+## TUN for Tailscale, OpenVPN and the like, for the same reason.
+CONFIG_PACKAGE_kmod-tun=y
+
+## WireGuard, for the same reason.
+CONFIG_PACKAGE_kmod-wireguard=y
+
+## Redundant Default Packages
+CONFIG_PACKAGE_wpad-basic-mbedtls=n
+CONFIG_PACKAGE_luci-app-attendedsysupgrade=n
+CONFIG_PACKAGE_attendedsysupgrade-common=n
+
+## Wired offload is the PPE through the kernel's own interfaces: routed and
+## NAT flows from the fw4 flowtable (kmod-nft-offload is a target default;
+## the image enables flow_offloading_hw on first boot), bridging and
+## multicast snooping through switchdev, and SQM through tc qdisc offload
+## (sqm-scripts' hw_ppe.qos, repinned by patches/feeds/ppe-nss/).
+CONFIG_PACKAGE_sqm-scripts=y
+CONFIG_PACKAGE_luci-app-sqm=y
+CONFIG_PACKAGE_ppe-qos=y
+CONFIG_PACKAGE_luci-app-ppe-qos=y
+## The tc userspace and the sched kmods the PPE offloads are driven from;
+## OpenWrt ships them as optional packages, so the images select them here.
+CONFIG_PACKAGE_tc-full=y
+CONFIG_PACKAGE_kmod-sched-flower=y
+CONFIG_PACKAGE_kmod-sched-prio=y
+CONFIG_PACKAGE_kmod-sched-act-police=y
+CONFIG_PACKAGE_kmod-sched-act-pedit=y
+CONFIG_PACKAGE_kmod-sched-act-vlan=y
+CONFIG_PACKAGE_kmod-sched-mqprio=y
+CONFIG_PACKAGE_kmod-sched-ets=y
+CONFIG_PACKAGE_kmod-sched-red=y
+CONFIG_PACKAGE_kmod-sched-gred=y
+CONFIG_PACKAGE_dcb=y
+CONFIG_PACKAGE_ethtool-full=y
+CONFIG_PACKAGE_devlink=y
+CONFIG_KERNEL_DCB=y
+
+## Routed multicast needs the mroute options and a userspace daemon to fill
+## the kernel MFC. Not bundled - add igmpproxy (or smcroute) in your fork if
+## you have a WAN multicast source. See docs/CUSTOMIZE.md.
+CONFIG_KERNEL_IP_MROUTE=y
+CONFIG_KERNEL_IPV6_MROUTE=y
+# CONFIG_PACKAGE_igmpproxy is not set
+
+## NSS Wi-Fi offload: nss-wifi-drv boots the NSS firmware and takes the
+## ath11k data path. On by default; off with:
+## uci set nss-wifi.general.offload=0; uci commit nss-wifi; reboot
+CONFIG_PACKAGE_kmod-nss-wifi-drv=y
+CONFIG_ATH11K_NSS_WIFI=y
+CONFIG_NSS_FIRMWARE_VERSION_12_5=y
+
+## Crash forensics: persist the kernel console and panic traces across
+## reboots in the board's ramoops region; the image archives them to
+## /root/pstore on the next boot.
+CONFIG_PACKAGE_kmod-ramoops=y
+
+#################################################
+# LuCI
+#################################################
+
+CONFIG_PACKAGE_luci-theme-bootstrap=y
+CONFIG_PACKAGE_luci-theme-footstrap=y
+
+CONFIG_PACKAGE_luci-app-adblock-fast=y
+CONFIG_PACKAGE_luci-app-banip=y
+CONFIG_PACKAGE_luci-app-commands=y
+CONFIG_PACKAGE_luci-app-ddns=y
+CONFIG_PACKAGE_luci-app-firewall=y
+CONFIG_PACKAGE_luci-app-https-dns-proxy=y
+CONFIG_PACKAGE_luci-app-ksmbd=y
+CONFIG_PACKAGE_luci-app-package-manager=y
+CONFIG_PACKAGE_luci-app-pbr=y
+CONFIG_PACKAGE_luci-app-statistics=y
+CONFIG_PACKAGE_luci-app-wifischedule=y
+CONFIG_PACKAGE_luci-app-wol=y
+CONFIG_PACKAGE_luci-proto-wireguard=y
+
+#################################################
+# Networking
+#################################################
+
+CONFIG_PACKAGE_dnsmasq-full=y
+
+CONFIG_PACKAGE_adblock-fast=y
+CONFIG_PACKAGE_banip=y
+CONFIG_PACKAGE_ddns-scripts=y
+CONFIG_PACKAGE_https-dns-proxy=y
+CONFIG_PACKAGE_pbr=y
+
+CONFIG_PACKAGE_wireguard-tools=y
+CONFIG_PACKAGE_zerotier=y
+
+#################################################
+# File Sharing
+#################################################
+
+CONFIG_PACKAGE_ksmbd-server=y
+CONFIG_PACKAGE_ksmbd-avahi-service=y
+CONFIG_PACKAGE_wsdd2=y
+CONFIG_PACKAGE_avahi-dbus-daemon=y
+
+CONFIG_PACKAGE_kmod-fs-btrfs=y
+CONFIG_PACKAGE_kmod-fs-exfat=y
+CONFIG_PACKAGE_kmod-fs-f2fs=y
+CONFIG_PACKAGE_kmod-fs-hfs=y
+CONFIG_PACKAGE_kmod-fs-hfsplus=y
+CONFIG_PACKAGE_kmod-fs-msdos=y
+CONFIG_PACKAGE_kmod-fs-ntfs=y
+CONFIG_PACKAGE_kmod-fs-vfat=y
+
+CONFIG_PACKAGE_f2fs-tools=y
+CONFIG_PACKAGE_exfat-fsck=y
+CONFIG_PACKAGE_exfat-mkfs=y
+
+#################################################
+# Monitoring
+#################################################
+
+CONFIG_PACKAGE_collectd=y
+CONFIG_PACKAGE_collectd-mod-cpu=y
+CONFIG_PACKAGE_collectd-mod-cpufreq=y
+CONFIG_PACKAGE_collectd-mod-interface=y
+CONFIG_PACKAGE_collectd-mod-iwinfo=y
+CONFIG_PACKAGE_collectd-mod-load=y
+CONFIG_PACKAGE_collectd-mod-memory=y
+CONFIG_PACKAGE_collectd-mod-network=y
+CONFIG_PACKAGE_collectd-mod-rrdtool=y
+CONFIG_PACKAGE_collectd-mod-sensors=y
+CONFIG_PACKAGE_collectd-mod-thermal=y
+CONFIG_PACKAGE_collectd-mod-wireless=y
+
+#################################################
+# BusyBox
+#################################################
+
+CONFIG_BUSYBOX_CUSTOM=y
+CONFIG_BUSYBOX_CONFIG_FEATURE_EDITING_HISTORY=1024
+CONFIG_BUSYBOX_CONFIG_FEATURE_EDITING_VI=y
+CONFIG_BUSYBOX_CONFIG_FEATURE_REVERSE_SEARCH=y
