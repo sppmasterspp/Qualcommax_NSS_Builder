@@ -29,14 +29,6 @@ CONFIG_USE_LTO=y
 CONFIG_USE_MOLD=y
 CONFIG_ZLIB_OPTIMIZE_SPEED=y
 
-## Every kernel module, published as the image's apk feed: the kernel's
-## vermagic depends on the selected modules, so only this build can serve them.
-CONFIG_ALL_KMODS=y
-## An ImageBuilder holding every package of this build, which the image
-## picker's custom builds (custom.yml) run from.
-CONFIG_IB=y
-CONFIG_IB_STANDALONE=y
-
 ## Kernel Build Options
 CONFIG_BUILD_PATENTED=y
 CONFIG_EXPERIMENTAL=y
@@ -51,12 +43,6 @@ CONFIG_KERNEL_CC_STACKPROTECTOR_STRONG=y
 CONFIG_PKG_FORTIFY_SOURCE_3=y
 CONFIG_PKG_RELRO_FULL=y
 CONFIG_USE_SECCOMP=y
-
-## SSH Server Configuration
-CONFIG_PACKAGE_dropbear=n
-CONFIG_PACKAGE_openssh-moduli=y
-CONFIG_PACKAGE_openssh-server=y
-CONFIG_PACKAGE_openssh-sftp-server=y
 
 ## SSL and Cryptography Configuration
 CONFIG_LUA_ECO_MBEDTLS=n
